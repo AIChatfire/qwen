@@ -281,6 +281,50 @@ Cookie: token=<JWT>
 | U-6 | 额度是"提交即扣"还是"成功才扣" | ⚠️ 未证实 | 对照实验：提交后立刻查额度 |
 | U-7 | 登录态 token 直接跑**视频**写端点 | ✅ **关闭（2026-09-22）** | `Cookie: token=<JWT>` 最小凭据跑通 t2v + i2v 真实出片（§7.1） |
 | U-8 | 同一 `chat_id` 上并发提交多个视频任务 | 🟡 保守规避 | 当前按账号串行 + 提交最小间隔（实践稳定）；并发未验 |
+| U-9 | **guest（匿名访客身份）能否提交视频任务** | ✅ **关闭（2026-09-22）：不支持** | 单发实测：免费段 `chats/new`（`chat_mode=guest` + `chat_type=t2v`）→ **200 受理**；真实一发 t2v 提交 → **`x-actual-status-code: 400` + `code=internal_error`**（无 task_id、未扣额度）。既非额度拒绝（会回 `RateLimited`+额度文案）也非凭据问题（会 401/RGV587）⇒ **guest 门接受会话但拒绝视频生成**。过程见 §9.2 |
+
+### 9.1 guest 通路的事实边界（2026-09-22 盘点，来源：既有取证，非新实验）
+
+| 事实 | 依据 |
+|---|---|
+| guest = **设备指纹身份**（cookie 无 `token`；`bx-ua` / `bx-umidtoken` / `ssxmod_itna` 等），由真浏览器铸造 | `qwen-chat-api.md` §2.6 |
+| guest 的**图片/文本**写端点已验证可用（4 鉴权 × 5 形态矩阵中 guest **5/5**，含 2.0/3.0-pro/16:9 与 t2t） | 同上 §2.13 |
+| guest **读不到额度视图**（`entitlement_quota` → `x-actual-status-code: 401`）；额度墙文案为「今日**生图**额度已用完，登录后可继续生图。」 | 同上 §2.6/§2.7 |
+| guest 额度**绑设备身份**（与出口 IP 无关），单身份约 4~5 张/天，且额度数额随模型不同 | 同上 §2.12 |
+| **完全未登录（anon）不可用**：3/3 在 `chats/new` 即 401 ⇒ 匿名必须走 guest 身份池 | 同上 §2.13 |
+| 视频写端点要求 `token` **cookie**（仅 `Authorization: Bearer` 会落 x5sec 惩罚流）；视频查询端点无凭据 → 401 | `qwen-async-task-api.md` §2.3 / `qwen-chat-api.md` §2.13 |
+| 视频额度项 `t2v`（3/天，t2v+i2v 共用）**只出现在登录态**的额度视图里 | `qwen-quota-api.md` §3 |
+| 上游 guest 通路属「抓一次包用一阵」形态（`ssxmod_itna` 无生成器），**不宜作无人值守生产凭据** | `qwen-chat-api.md` §2.6 |
+
+**结论（供决策，不是实现依据）**：guest 能到达**同一个**写端点（图片已证），故"能不能发出 t2v 请求"机械上大概率可以；
+但 guest 档位的产品语义是**生图**（额度文案与不可读视图都指向此），视频额度大概率**不在 guest 档位** ⇒
+预期结果是同类 `RateLimited` 拒绝。**要定论必须实测**，路径见 §9.2。
+
+### 9.2 guest × 视频：判定实验与结果（2026-09-22 已执行，**单发**）
+
+探针：`scripts/probe_guest_video.py`（单发写死在代码里：不重试、不换身份、不打印凭据；须显式 `--confirm` 才真发）。
+身份：用 `reverse-proxy/qwen/tools/make_identities.py 1` **现铸一条全新 guest 身份**
+（Playwright + 系统 Chrome，7.4s，`bx-ua` 版本 `234!` 与当前 fireye 对齐）—— 用新身份是为了**排除"身份过期"这个混淆项**。
+
+| 步骤 | 请求 | 结果 |
+|---|---|---|
+| ① 零成本 · UI 取证 | Playwright 载入 `/c/guest` | 🔴 **直接跳转 `https://chat.qwen.ai/auth`**（登录/注册页）；页面无「视频」「图像生成」等任何生成入口 ⇒ 访客 **UI 入口已不存在**（截图：`var/probe/20260922_guest_redirect_to_auth.png`） |
+| ② 免费段 · 会话取证 | `POST /api/v2/chats/new`（`chat_mode=guest`、`chat_type=t2v`） | ✅ **200 + `success=true`**，回 `chat_id` ⇒ 身份有效、指纹通过、无 WAF/RGV587；**API 层的 guest 门接受 t2v 会话** |
+| ③ **真实一发** | `POST /api/v2/chat/completions?chat_id=…`（`stream:false`） | 🔴 **`x-actual-status-code: 400`**、`success=false`、`code=internal_error`、`details=Internal Error`；**无 task_id** |
+
+**判决**：guest × 视频 = **不支持**。三项证据互不冲突：API 门收会话（②）但拒生成（③），UI 层则干脆把访客入口撤了（①）。
+
+**边界与注意**：
+- 🔴 这不是"额度不够"：额度拒绝的形态是 `code=RateLimited` + 「今日…额度已用完」文案（`qwen-chat-api.md` §2.12）；
+  也不是"参数写错"：缺 `version` 头的形态是 `Bad_Request`（`qwen-async-task-api.md` §7.3），而本次该头已带。
+  `internal_error` 是上游在"这条路走不通"时给的**无信息量错误码**（同类已知用法：`3.0-pro` 传超大 `size` 也回它）。
+- **未扣额度**：无 task_id、无产物，`t2v` 计数不变；单发即停（遵守 `R-2`：写端点勿连打）。
+- ⚠️ **未验证（不得推断）**：**图片侧的 guest 通路今天是否仍可用**。历史实证是 09-18/19（矩阵 5/5、批量出图工具），
+  而本次 ① 显示访客 UI 已被重定向到登录页 ⇒ 存在"guest 通路整体收紧"的可能。
+  要定论只需**一发 t2i**（会消耗一条 guest 身份 1 张图额度）；在那之前，**不得**把"guest 出图仍可用"当现状。
+- 本服务**不受影响**：本服务凭据恒为账号 token（`chat_mode="normal"`），与 guest 门无关（§2.1）。
+
+
 
 ---
 
@@ -290,3 +334,5 @@ Cookie: token=<JWT>
 |---|---|
 | 2026-09-22 | 首次成文：整合 `reverse-proxy` / `video-adapter` 既有取证 + 用户当日抓包（i2v 完整头版）；确立"token 最小凭据 + 完整头 + 三处同标 + `wanx.task_id` 路径"四条实现依据 |
 | 2026-09-22 | **真实链路首测（经本服务）**：signin ✅（token_len=209）/ t2v ✅ / i2v ✅，两条产物下载核验（均 5.042s）；U-7 关闭、U-1 部分关闭；补 §6.4 耗时波动观测与 §7.1 出片实录 |
+| 2026-09-22 | 登记 **U-9（guest × 视频）** 并补 §9.1 事实边界 / §9.2 分级判定实验：guest 在图片面已证可用、视频面**零证据**；澄清"本服务无 guest 通路"（凭据恒为账号 token、`chat_mode` 固定 `normal`） |
+| 2026-09-22 | **U-9 单发实测关闭**：现铸全新 guest 身份 → `chats/new(guest,t2v)` 200 / 真实一发 t2v 提交 **400 `internal_error`**（未扣额度）⇒ **guest 不支持视频**；同时观测到 `/c/guest` **已重定向 `/auth`**（访客 UI 入口消失）。新增探针 `scripts/probe_guest_video.py`（单发/不重试/不打印凭据）。⚠️ 登记新未决：**图片侧 guest 通路今日是否仍可用**（需一发 t2i 才能定论） |
