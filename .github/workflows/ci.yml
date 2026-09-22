@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 静态门禁。**刻意只跑能抓真缺陷的规则**（见 ruff.toml 的说明）：
+  # 一次报上百条的门禁等于没有门禁 —— 没人看，于是连真问题一起忽略。
+  # ---------------------------------------------------------------------------
+  lint:
+    name: 静态门禁（ruff）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install --disable-pip-version-check ruff
+      #: 不装依赖也能跑（只做静态分析）⇒ 门禁比别人快，也更容易保持必过
+      - name: ruff check
+        run: ruff check .
+
+  # ---------------------------------------------------------------------------
+  # 测试。**零真实网络（含 DNS）**：夹具全部走 httpx.MockTransport。
+  # 不需要数据库服务（SQLite 默认）⇒ 无需 service container，跑得快。
+  # ---------------------------------------------------------------------------
+  test:
+    name: 测试（pytest）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        #: 3.11 跑不了：app/ark.py 用了 PEP 701 的嵌套引号 f-string（3.12+ 语法）
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('requirements*.txt') }}
+      - run: pip install --disable-pip-version-check -r requirements-dev.txt
+      #: 🔴 测试**绝不碰真实网络**。若哪天有人加了一条真实调用，
+      #: 它会在这里超时/失败 —— 这是有意的。
+      - name: pytest
+        run: python -m pytest -q
+
+  # ---------------------------------------------------------------------------
+  # 启动冒烟：**证明服务起得来且两条安全闸门都在**。
+  # 🔴 冒烟**不带任何真实凭据**：账号池为空 + 上游指向死端口 ——
+  #    一旦有代码路径试图联网，会以连接失败/502 现形，而不是"悄悄打了真的上游"。
+  #    有账号池才允许提交（无账号 ⇒ 503 CredentialUnavailable），本冒烟同时钉住这条。
+  # ---------------------------------------------------------------------------
+  smoke:
+    name: 启动冒烟（零凭据 + 死端口护栏）
+    runs-on: ubuntu-latest
+    env:
+      QWEN_BASE_URL: "http://127.0.0.1:9"
+      API_KEYS: "sk-smoke"
+      TASK_DB: "sqlite:///./smoke.db"
+      COORDINATOR_ENABLED: "0"
+      PORT: "8400"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install --disable-pip-version-check -r requirements.txt
+      - name: 起服务并验两条闸门
+        run: |
+          set -euo pipefail
+          gunicorn -c gunicorn_conf.py "app.main:create_app()" &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8400/healthz > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8400/healthz; echo
+          # 无凭据部署的自报状态：accounts=0 且 store 可用
+          # （**刻意允许**"先起服务、后配凭据"—— 这是部署期的正常形态）
+          curl -sf http://127.0.0.1:8400/readyz | tee /tmp/ready.json; echo
+          python -c "import json;d=json.load(open('/tmp/ready.json'));assert d['accounts']==0 and d['store']=='ok',d"
+          # dry-run：零成本预演可跑（不提交、不落库）
+          curl -sf -X POST http://127.0.0.1:8400/api/v3/contents/generations/tasks \
+            -H "Authorization: Bearer sk-smoke" -H 'X-Avm-Dry-Run: 1' \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen/video","content":[{"type":"text","text":"smoke"}],"ratio":"16:9"}' \
+            | tee /tmp/dry.json; echo
+          python -c "import json;d=json.load(open('/tmp/dry.json'));assert d['dry_run'] is True and 'upstream' in d,d"
+          # 鉴权接线：无 key 的创建请求必须 401（在 healthz 成功之后再探）
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            http://127.0.0.1:8400/api/v3/contents/generations/tasks \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen/video","content":[{"type":"text","text":"smoke"}]}')" = "401"
+          # 部署闸门：带 key 但账号池为空 ⇒ 503 CredentialUnavailable
+          # （拒绝发生在**发出上游请求之前**；死端口保证"真发了"会以别的形态炸出来）
+          curl -s -X POST http://127.0.0.1:8400/api/v3/contents/generations/tasks \
+            -H "Authorization: Bearer sk-smoke" -H 'Content-Type: application/json' \
+            -d '{"model":"qwen/video","content":[{"type":"text","text":"smoke"}]}' \
+            | tee /tmp/accept.json; echo
+          python -c "import json;d=json.load(open('/tmp/accept.json'));assert d['error']['code']=='CredentialUnavailable',d"
+          echo "冒烟通过：起得来、dry-run 可跑、鉴权接线、零凭据部署闸门成立（全程零真实上游）"
