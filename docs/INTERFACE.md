@@ -198,6 +198,7 @@ X-Avm-Dry-Run: 1
 | `QWEN_CHAT_MODEL` | `qwen3.7-plus` | 会话聊天模型（非"视频模型"） |
 | `QWEN_ACCOUNTS` / `QWEN_ACCOUNT_PASSWORD` / `QWEN_ACCOUNTS_FILE` | — | 账号池（多账号轮换；额度 3 次/天/账号） |
 | `QWEN_ACCOUNT_COOKIES[_FILE]` | 空 | 可选：每账号附加 cookie（整份 jar 或指纹 cookie）；默认只发 `token` 最小凭据 |
+| `QWEN_TRUST_ENV` | `0` | 🔴 **别开**：置 1 会让使用侧读取宿主环境代理变量 ⇒ 出口变成"经代理、可能一请求一 IP"（静默行为改变）。详见 `UPSTREAM.md` §2.5 |
 | `QWEN_SIGNIN_SOCKS` | 空 | **轮换 SOCKS5 出口**（signin 必须走它，直连会把出口打进 WAF 墙） |
 | `QWEN_TOKEN_URL` | 空 | 或改用外部 token 服务（`GET /token?account=`，同 image-adapter） |
 | `QWEN_DAILY_VIDEO_CAP` | `3` | 每账号每日视频额度（**UTC 日**窗口） |
