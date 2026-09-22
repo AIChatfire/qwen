@@ -1,4 +1,4 @@
-"""账号池 —— 多账号轮换 / 额度计数 / 冷却 / token 缓存。
+"""账号池 —— 多账号轮换 / 额度计数 / 冷却 / token 缓存 / **状态可持久化**。
 
 设计要点（沿既有项目的教训）：
   · **登录走轮换出口、出图/出片走正常出口**（token 是无状态 JWT）⇒ signin 与使用分离；
@@ -6,13 +6,17 @@
     正好撞上 signin 的 IP 级墙 —— image-adapter 实测过）；
   · **跨账号共享一个 signin 节奏**（几秒内连登多个账号 ⇒ 后几个吃挑战页）；
   · 额度按 **UTC 日**分桶（上游额度窗口是 UTC 日，本地日会提前 8 小时"误判恢复"）；
-  · 状态端点**不含 token 原文**（只给是否缓存/指纹级信息），邮箱做半脱敏。
+  · 状态端点**不含 token 原文**（只给是否缓存/指纹级信息），邮箱做半脱敏；
+  · 🔴 **额度计数与冷却可落盘**（`snapshot()/restore()` + `on_change` 回调，由装配层接
+    KV）—— 只持久化"计数与冷却"这类额度语义；**token 不进持久层**（重启重新铸造，免费）。
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
@@ -20,6 +24,8 @@ import httpx
 from ...config import Settings
 from ...errors import CredentialUnavailableError, RateLimitedError
 from .signin import MintError, WallError, mint_token
+
+logger = logging.getLogger("qwen.accounts")
 
 #: 失败种类 → 冷却时长（秒）；"quota" 特殊：冷到下一个 UTC 日。
 COOLDOWN_SECONDS = {
@@ -79,6 +85,56 @@ class AccountPool:
         self._last_signin_at = 0.0
         self._mint = mint or self._mint_default
         self._now = now or time.time
+        #: 状态变更回调（装配层注入 ⇒ 落 KV）。失败只记日志，绝不阻断主流程。
+        self.on_change: Callable[[], None] | None = None
+
+    # ------------------------------------------------------------------ 耐久化
+
+    def snapshot(self) -> dict:
+        """额度计数 + 冷却的快照（**不含 token**）。"""
+        with self._lock:
+            return {
+                "version": 1,
+                "saved_at": int(self._now()),
+                "accounts": {
+                    a.email: {
+                        "day": a.day,
+                        "day_used": a.day_used,
+                        "cooldown_until": round(a.cooldown_until, 3),
+                        "cooldown_reason": a.cooldown_reason,
+                    }
+                    for a in self._accounts.values()
+                },
+            }
+
+    def restore(self, data: dict | None) -> None:
+        """从快照恢复（宽容解析：未知账号/坏行一律忽略，**绝不因坏数据拒绝启动**）。"""
+        if not isinstance(data, dict):
+            return
+        rows = data.get("accounts")
+        if not isinstance(rows, dict):
+            return
+        with self._lock:
+            for email, row in rows.items():
+                account = self._accounts.get(email)
+                if account is None or not isinstance(row, dict):
+                    continue
+                try:
+                    account.day = str(row.get("day") or account.day)
+                    account.day_used = max(0, int(row.get("day_used") or 0))
+                    account.cooldown_until = float(row.get("cooldown_until") or 0.0)
+                    account.cooldown_reason = str(row.get("cooldown_reason") or "")
+                except (TypeError, ValueError):
+                    continue
+
+    def _notify(self) -> None:
+        callback = self.on_change
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - 回调不许影响主流程
+            logger.warning("账号池状态持久化回调失败（忽略）", exc_info=True)
 
     # ------------------------------------------------------------------ 铸造
 
@@ -179,7 +235,7 @@ class AccountPool:
             return earliest, max(0.0, ready_at(earliest) - now)
 
     def acquire_with_wait(self) -> AccountState:
-        """在 `account_wait_timeout` 内等到一个账号；等不到抛 429。"""
+        """在 `account_wait_timeout` 内等到一个账号；等不到抛 429（调用方/队列层接住）。"""
         if not self._accounts:
             raise CredentialUnavailableError(
                 "未配置任何账号（QWEN_ACCOUNTS）—— 部署问题，不是调用方的错")
@@ -212,6 +268,7 @@ class AccountPool:
             account.day_used += 1
             account.last_submit_at = now
             account.inflight += 1
+        self._notify()
 
     def report_finished(self, email: str) -> None:
         with self._lock:
@@ -237,6 +294,7 @@ class AccountPool:
             if kind == "auth":
                 account.token = ""
                 account.minted_at = 0.0
+        self._notify()
 
     # ------------------------------------------------------------------ 观测
 

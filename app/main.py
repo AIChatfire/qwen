@@ -1,8 +1,8 @@
 """FastAPI 应用工厂 —— 路由 / 错误信封 / 鉴权 / 健康检查 一处收拢。
 
 对外路由（**范围冻结**：核心两个端点；列表与取消刻意不实现 ⇒ 路由不存在）：
-    POST /api/v3/contents/generations/tasks       创建（只回 {"id": …}）
-    GET  /api/v3/contents/generations/tasks/{id}  查询（方舟任务对象形状）
+    POST /api/v3/contents/generations/tasks       创建（只回 {"id": …}；容量不足默认排队）
+    GET  /api/v3/contents/generations/tasks/{id}  查询（方舟任务对象形状；顺带推进任务）
     GET  /healthz /readyz /stats                 运维面（不含任何凭据原文）
 
 调试面：`X-Avm-Dry-Run: 1` 请求头 ⇒ 跑完整翻译后返回"将要发出的请求"，**零上游调用、零落库**。
@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import uuid
@@ -32,10 +33,28 @@ from .upstream.qwen.client import QwenClient
 
 logger = logging.getLogger("qwen.main")
 
+#: 账号池状态的 KV 键（额度计数 + 冷却；**不含 token**）
+POOL_STATE_KEY = "state:pool"
+
 
 def fingerprint(secret: str, key: str) -> str:
     """API Key → 指纹（HMAC-SHA256，永不落明文；裸 sha256 对低熵 Key 不够）。"""
     return "hmac-sha256:" + hmac.new(secret.encode(), key.encode(), hashlib.sha256).hexdigest()
+
+
+def bind_pool_state(store: TaskStore, pool: AccountPool) -> None:
+    """账号池的**耐久化**：启动时恢复、变更即落 KV ⇒ 重启不丢额度计数与冷却。
+
+    token 刻意**不进持久层**（重启重新铸造，免费；避免凭据落盘）。
+    """
+    raw = store.kv_get(POOL_STATE_KEY)
+    if raw:
+        try:
+            pool.restore(json.loads(raw))
+        except ValueError:
+            logger.warning("账号池状态恢复失败（忽略，按空状态起）")
+    pool.on_change = lambda: store.kv_set(
+        POOL_STATE_KEY, json.dumps(pool.snapshot(), ensure_ascii=False))
 
 
 def create_app(settings: Settings | None = None, *, store: TaskStore | None = None,
@@ -51,6 +70,7 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
     client = client or QwenClient(settings)
     service = service or QwenVideoService(settings, store, pool, client)
     secret = settings.resolved_key_secret()
+    bind_pool_state(store, pool)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -140,7 +160,8 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
     async def stats():
         return {
             "accounts": pool.stats(),
-            "tasks": {"total": store.count(), "active": store.count_active()},
+            "tasks": {"total": store.count(), "active": store.count_active(),
+                      "queued": store.count_queued()},
         }
 
     return app

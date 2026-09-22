@@ -4,8 +4,11 @@
 契约要求 `GET /tasks/{id}` 在 7 天窗口内可用，重启后查不到 = 调用方以为还在跑的任务凭空消失。
 所以**不允许"进程内 dict 兜底"**；DSN 配错要直接抛（不静默退化成内存）。
 
-存储层接口化：`put/get/delete/list_recent/list_active/count/prune` + `kv_*`，
+存储层接口化：`put/get/delete/list_recent/list_active/count/count_queued/prune` + `kv_*`，
 换后端时调用方零改动。
+
+加字段的口径（沿用 jimeng 的教训）：**SQLModel 的 `create_all` 只建表、不改已有表** ——
+本类启动期用 `_ensure_columns()` 做幂等补列；以后加列照此，别走手工 ALTER。
 """
 from __future__ import annotations
 
@@ -35,6 +38,9 @@ class TaskRecord(SQLModel, table=True):
     error_code: str | None = None
     error_message: str | None = None
     degradations_json: str = "[]"
+    #: 轻量队列：已尝试提交次数 / 下次可尝试的 epoch 秒（退避窗）
+    attempts: int = 0
+    next_attempt_at: int = 0
     created_at: int = 0
     updated_at: int = 0
 
@@ -51,7 +57,7 @@ class TaskRecord(SQLModel, table=True):
 
 
 class KVRecord(SQLModel, table=True):
-    """通用小状态：目前用于每账号复用的 `chat_id`。"""
+    """通用小状态：每账号复用的 `chat_id`、账号池的额度/冷却快照。"""
 
     __tablename__ = "qwen_kv"
 
@@ -75,6 +81,27 @@ class TaskStore:
                 Path(path_part).parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(dsn, connect_args=connect_args, pool_pre_ping=True)
         SQLModel.metadata.create_all(self.engine)
+        self._ensure_columns()
+
+    def _ensure_columns(self) -> None:
+        """幂等补列（`create_all` 不改已有表）。旧库升级后 `put()` 不会再报 column does not exist。"""
+        wanted = {
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "next_attempt_at": "INTEGER NOT NULL DEFAULT 0",
+        }
+        table = TaskRecord.__tablename__
+        with self.engine.begin() as conn:
+            if self.engine.dialect.name == "sqlite":
+                rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+                existing = {row[1] for row in rows}
+            else:
+                rows = conn.exec_driver_sql(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                    (table,)).fetchall()
+                existing = {row[0] for row in rows}
+            for name, ddl in wanted.items():
+                if name not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     # ------------------------------------------------------------------ 任务
 
@@ -124,6 +151,11 @@ class TaskStore:
 
     def count_active(self) -> int:
         return len(self.list_active())
+
+    def count_queued(self) -> int:
+        with Session(self.engine) as session:
+            stmt = select(TaskRecord).where(TaskRecord.status == "queued")  # type: ignore[attr-defined]
+            return len(list(session.exec(stmt)))
 
     def prune(self, days: int = 7) -> int:
         """删除早于 `days` 天的**终态**记录（保留期按 `created_at` 起算，非终态一律不动）。"""

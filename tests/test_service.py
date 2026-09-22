@@ -142,10 +142,10 @@ def test_duration_eight_clamped_and_reported_without_leaking_upstream(client_app
 
 
 def test_pool_exhausted_is_429_with_retry_after_and_zero_upstream(settings, fake_upstream):
-    """上限闸门必须生效在「发出请求之前」——用 0 额度假设置接死。"""
+    """**严格模式**（SUBMIT_QUEUE_ENABLED=0）：上限闸门必须生效在「发出请求之前」——用 0 额度假设置接死。"""
     from fastapi.testclient import TestClient
 
-    over = dataclasses.replace(settings, daily_video_cap=0)
+    over = dataclasses.replace(settings, daily_video_cap=0, submit_queue_enabled=False)
     store = TaskStore(over.task_db)
     pool = AccountPool(over, mint=lambda account: "tok")
     client = QwenClient(over, transport=fake_upstream.transport())

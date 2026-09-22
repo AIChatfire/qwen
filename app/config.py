@@ -111,6 +111,12 @@ class Settings:
     daily_video_cap: int = 3
     account_wait_timeout: float = 30.0
 
+    # —— 轻量队列 / 重试（"自己排队、自己重试"；关闭则回到严格 429） ——
+    submit_queue_enabled: bool = True
+    queue_max_depth: int = 50
+    submit_max_attempts: int = 5
+    queue_retry_base: float = 30.0
+
     # —— 对外鉴权 ——
     api_keys: list[str] = field(default_factory=list)
     key_secret: str = ""
@@ -121,7 +127,7 @@ class Settings:
     poll_interval: float = 3.0
     task_timeout: float = 900.0
     task_retention_days: int = 7
-    coordinator_enabled: bool = False
+    coordinator_enabled: bool = True
     coordinator_tick: float = 5.0
 
     # —— 进程 ——
@@ -151,6 +157,10 @@ class Settings:
             submit_min_interval=_num(env, "QWEN_SUBMIT_MIN_INTERVAL", 15.0),
             daily_video_cap=_int(env, "QWEN_DAILY_VIDEO_CAP", 3),
             account_wait_timeout=_num(env, "QWEN_ACCOUNT_WAIT_TIMEOUT", 30.0),
+            submit_queue_enabled=_bool(env, "SUBMIT_QUEUE_ENABLED", True),
+            queue_max_depth=_int(env, "QUEUE_MAX_DEPTH", 50),
+            submit_max_attempts=_int(env, "SUBMIT_MAX_ATTEMPTS", 5),
+            queue_retry_base=_num(env, "QUEUE_RETRY_BASE", 30.0),
             api_keys=[p.strip() for p in _env(env, "API_KEYS").split(",") if p.strip()],
             key_secret=_env(env, "KEY_SECRET"),
             task_db=task_db,
@@ -158,7 +168,7 @@ class Settings:
             poll_interval=_num(env, "POLL_INTERVAL", 3.0),
             task_timeout=_num(env, "TASK_TIMEOUT", 900.0),
             task_retention_days=_int(env, "TASK_RETENTION_DAYS", 7),
-            coordinator_enabled=_bool(env, "COORDINATOR_ENABLED", False),
+            coordinator_enabled=_bool(env, "COORDINATOR_ENABLED", True),
             coordinator_tick=_num(env, "COORDINATOR_TICK", 5.0),
             host=_env(env, "HOST") or "0.0.0.0",
             port=_int(env, "PORT", 8400),

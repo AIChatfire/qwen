@@ -73,6 +73,8 @@ Authorization: Bearer <key>
 
 - **只回 `id`**，不含 status（必须轮询或查询）。
 - `id` 由本服务生成（`cgt-YYYYMMDDHHMMSS-xxxxx`）；上游 UUID 只存本层记录与观测面。
+- 容量不足时**不再回 429**：任务落 `queued` 并**立即**返回 id（`queued` 是方舟契约里的合法初始态），
+  详见 §3.3。只有**排队深度**超 `QUEUE_MAX_DEPTH` 才回 429 背压。
 
 ---
 
@@ -108,14 +110,33 @@ Authorization: Bearer <key>
 
 | status | 语义 | 终态 |
 |---|---|---|
-| `queued` | 已受理（本实现创建后直接落 `running`，一般观察不到） | 否 |
+| `queued` | **已受理但还没递交给上游**（账号全忙/冷却/额度用尽 ⇒ 排队等窗口；详见 §3.3） | 否 |
 | `running` | 上游生成中（实测 t2v/i2v ≈105s 出片） | 否 |
 | `succeeded` | 成功（`content.video_url` 可用） | 是 |
-| `failed` | 失败/上游任务不存在/零产物 | 是 |
+| `failed` | 失败/上游任务不存在/零产物/排队超时或超次数（`error.message` 会写明"未提交、未消耗额度"） | 是 |
 | `expired` | 超过 `TASK_TIMEOUT`（默认 900s）仍未终态 | 是 |
 
-**查询是"惰性回查"**：调用方每 GET 一次，本服务回查上游一次；终态后不再打扰上游。
-（可选后台协调器 `COORDINATOR_ENABLED=1` 可主动回查并落终态。）
+**查询是"惰性回查"**：调用方每 GET 一次，本服务推进该任务一格（`queued` ⇒ 尝试提交；
+`running` ⇒ 回查上游一次）；终态后不再打扰上游。
+（后台协调器 `COORDINATOR_ENABLED=1`，**默认开**，无人查询时也照常推进。）
+
+### 3.3 排队 / 重试 / 重启耐久（轻量实现）
+
+**没有引入任何独立队列组件** —— 队列就是任务表本身（`status='queued'` 的记录），
+消费者是既有件：后台协调器 + 调用方的 GET。
+
+| 关切 | 本服务行为 |
+|---|---|
+| 容量不足 | 落 `queued`，**立即**返回 id（不再硬 429）；由协调器 / 后续 GET 出队提交 |
+| 排队深度 | ≥ `QUEUE_MAX_DEPTH`（默认 50）⇒ **429 + `Retry-After`**（背压保留，绝不无限囤积） |
+| 重试范围 | **只重试"可证明上游未受理"的失败**：风控（RGV587）、额度耗尽、鉴权失效、凭据铸造失败、会话失效 |
+| 不重试范围 | 含义不明的失败（上游 5xx / 超时 / 未知业务码）—— 建任务是**计费动作**，"可能已提交"的重试等于赌重复计费 ⇒ 照实回报错误，任务落 `failed` |
+| 退避 | 指数退避（`QUEUE_RETRY_BASE × 2^n`，上限 600s），并受 `SUBMIT_MAX_ATTEMPTS`（默认 5）与 `TASK_TIMEOUT` 双闸门封顶；`failed` 的 `error.message` 会显式声明"未提交、未消耗额度" |
+| 重启不丢 | `queued` / `running` 记录都在任务库（≥`TASK_RETENTION_DAYS`=7 天）；**账号额度计数与冷却也在 KV 里** ⇒ 新进程起来接着推进，不会把已用额度算成 0 |
+| 重启重新铸造 | 上游 token **刻意不落盘**（重启重新 signin，免费；避免凭据进持久层） |
+| 请求去重 | ⚠️ **不提供**：同一 `POST` 重发两次 = 两条独立任务（方舟原生同样不保证幂等）。需要去重请在调用方做 |
+
+> 关闭队列回到严格模式：`SUBMIT_QUEUE_ENABLED=0`（容量不足 ⇒ 立即 429，与既有调用方行为一致）。
 
 ---
 
@@ -133,10 +154,10 @@ Authorization: Bearer <key>
 | 400 | `InvalidParameter` | 请求写错（含 content 角色/图片数量/duration<5/模型 provider 错） | 改请求 |
 | 401 | `AuthenticationError` | Key 缺失/无效 | 检查 Key |
 | 404 | `InvalidEndpointOrModel.NotFound` | 任务不存在**或不属于该 Key** | 检查 id / Key |
-| 429 | `RateLimitExceeded` | 账号池暂时排不上（全冷却/额度用尽/节奏窗） | 按 `Retry-After` 退避 |
-| 429 | `ServerOverloaded` | 上游 x5sec 风控（RGV587） | **退避，勿连打**（重试会加深标记） |
-| 429 | `QuotaExceeded` | 账号额度耗尽（3 次/天/账号，UTC 日重置） | 等跨日或换渠道 |
-| 502 | `InternalServiceError` | 上游 5xx / 非 JSON / WAF 页 | 退避重试 |
+| 429 | `RateLimitExceeded` | **排队深度超限**（`QUEUE_MAX_DEPTH`）或关闭队列时的容量不足 | 按 `Retry-After` 退避 |
+| 429 | `ServerOverloaded` | 上游 x5sec 风控（RGV587）；队列开启时通常不再直通（会排队换号重试，除非超次数） | **退避，勿连打**（重试会加深标记） |
+| 429 | `QuotaExceeded` | 账号额度耗尽（3 次/天/账号，UTC 日重置）；队列开启时通常转成排队 | 等跨日或换渠道 |
+| 502 | `InternalServiceError` | 上游 5xx / 非 JSON / WAF 页（**不自动重试**，防重复计费） | 退避重试 |
 | 503 | `CredentialUnavailable` | 本服务**凭据铸造/续期失败**（部署问题，非调用方错） | 联系运维（检查 `QWEN_SIGNIN_SOCKS` / `QWEN_TOKEN_URL`） |
 | 504 | `InternalServiceError` | 上游超时 | 退避重试 |
 
@@ -182,12 +203,17 @@ X-Avm-Dry-Run: 1
 | `QWEN_DAILY_VIDEO_CAP` | `3` | 每账号每日视频额度（**UTC 日**窗口） |
 | `QWEN_SUBMIT_MIN_INTERVAL` | `15` | 同账号提交最小间隔（防写请求突发） |
 | `QWEN_SIGNIN_MIN_INTERVAL` | `45` | 跨账号共享的 signin 节奏 |
+| `SUBMIT_QUEUE_ENABLED` | `1` | 轻量排队重试总开关（`0` = 严格模式：容量不足立即 429） |
+| `QUEUE_MAX_DEPTH` | `50` | 排队深度上限（超限 ⇒ 429 背压） |
+| `SUBMIT_MAX_ATTEMPTS` | `5` | 单任务最大提交尝试次数（超限 ⇒ `failed`，明示未消耗额度） |
+| `QUEUE_RETRY_BASE` | `30` | 排队重试退避基数（秒，指数退避，上限 600s） |
 | `API_KEYS` | 空 | 对外 Key（逗号分隔）；空 = 关闭鉴权（仅内网） |
 | `TASK_DB` | `sqlite:///<DATA_DIR>/qwen.db` | 任务库（多实例请换 PostgreSQL） |
-| `TASK_TIMEOUT` | `900` | 未终态任务的超时阈值（→ `expired`） |
+| `TASK_TIMEOUT` | `900` | 未终态任务的超时阈值（→ `expired`；排队中的任务同样受此闸门） |
 | `TASK_RETENTION_DAYS` | `7` | 记录保留期（契约要求 ≥7 天） |
-| `COORDINATOR_ENABLED` | `0` | 可选后台协调器（主动回查 + 过期） |
+| `COORDINATOR_ENABLED` | `1` | 后台协调器（出队排队任务 + 主动回查 + 过期清理） |
+| `COORDINATOR_TICK` | `5` | 协调器轮询间隔（秒） |
 | `WORKERS` / `PORT` | `1` / `8400` | 单 worker 是架构约束（节奏是进程内状态） |
 
 **运维面**：`/healthz`（存活）、`/readyz`（账号数/store/coordinator）、`/stats`
-（账号池统计：**邮箱半脱敏、无 token 原文**，含冷却与今日用量）。
+（账号池统计：**邮箱半脱敏、无 token 原文**，含冷却与今日用量；`tasks.queued` 给出排队深度）。

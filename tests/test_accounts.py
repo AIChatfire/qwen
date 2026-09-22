@@ -151,3 +151,53 @@ def test_stats_masks_emails_and_never_leaks_tokens(settings):
     assert any(row["account"] == "a***@x.cn" for row in stats["accounts"])
     assert all("token" not in row or row.get("token_cached") is not None
                for row in stats["accounts"])
+
+
+# ---------------------------------------------------------------- 池状态耐久化
+
+
+def test_snapshot_and_restore_carry_quota_and_cooldown(settings):
+    """重启不丢额度计数与冷却（快照只含计数/冷却，不含 token）。"""
+    clock = Clock()
+    pool = make_pool(settings, clock)
+    account, _ = pool.acquire()
+    pool.report_submitted(account.email)
+    pool.report_failure("b@x.cn", "risk")
+    snapshot = json.loads(json.dumps(pool.snapshot()))   # 过一遍 JSON = 真实持久化形态
+
+    restored = make_pool(settings, clock)                # “重启”
+    restored.restore(snapshot)
+    assert restored.get_state(account.email).day_used == 1
+    assert restored.get_state("b@x.cn").cooldown_until > clock.t
+    assert restored.get_state("b@x.cn").cooldown_reason == "risk"
+    # 冷却仍然生效：下一号只能是被冷掉的那个之外的账号
+    nxt, _ = restored.acquire()
+    assert nxt is not None and nxt.email == account.email
+
+
+def test_restore_is_lenient_with_unknown_rows_and_garbage(settings):
+    """坏数据/未知账号一律忽略，绝不因快照损坏拒绝启动。"""
+    pool = make_pool(settings, Clock())
+    pool.restore(None)
+    pool.restore({"accounts": "nope"})
+    pool.restore({"accounts": {"ghost@x.cn": {"day_used": 99}, "a@x.cn": "not-a-dict"}})
+    assert pool.get_state("a@x.cn").day_used == 0
+    assert pool.get_state("a@x.cn").cooldown_until == 0.0
+
+
+def test_on_change_callback_fires_and_its_failure_is_contained(settings):
+    """状态变更触发回调（装配层用它落 KV）；回调炸了不许影响主流程。"""
+    fired: list[int] = []
+    pool = make_pool(settings, Clock())
+    pool.on_change = lambda: fired.append(1)
+    account, _ = pool.acquire()
+    pool.report_submitted(account.email)
+    pool.report_failure(account.email, "risk")
+    assert len(fired) == 2
+
+    def boom() -> None:
+        raise RuntimeError("boom")
+
+    pool.on_change = boom
+    pool.report_submitted(account.email)     # 不抛异常
+    assert pool.get_state(account.email).day_used == 2

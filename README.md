@@ -1,7 +1,7 @@
 # qwen-service
 
 chat.qwen.ai 视频生成（**t2v / i2v**）的**火山方舟 Seedance 契约出口**：
-多账号池（登录态最小凭据）+ 完整浏览器指纹请求头 + 惰性轮询，
+多账号池（登录态最小凭据）+ 完整浏览器指纹请求头 + 惰性轮询 + **轻量排队重试（重启不丢任务）**，
 一条 `cgt-…` 任务贯穿创建与查询。调用方**只换 Base URL + Key** 即可接入。
 
 ```
@@ -24,6 +24,7 @@ GET  /healthz · /readyz · /stats                                      运维�
 | 改"多账号怎么轮换、冷却、计额度" | `app/upstream/qwen/accounts.py` |
 | 改登录铸造（signin / 轮换出口） | `app/upstream/qwen/signin.py` |
 | 改方舟 ↔ qwen 的翻译与降级口径 | `app/ark.py`（纯函数，测试主战场） |
+| **改"排队 / 重试 / 出队"策略** | `app/service.py`（编排）+ `app/store.py`（`queued` 记录、`attempts`/`next_attempt_at`）+ `app/coordinator.py`（出队与推进） |
 | 改任务存取 | `app/store.py`（SQLModel；SQLite 默认 / PostgreSQL 可选） |
 | 改对外鉴权与路由 | `app/main.py` |
 | 改上游有没有这个能力 / 未证实项 | `docs/UPSTREAM.md` |
@@ -63,7 +64,7 @@ curl -s localhost:8400/api/v3/contents/generations/tasks \
 ### 测试
 
 ```bash
-/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 84 项，零网络
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 94 项，零网络
 /Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/ruff check .
 ```
 
@@ -83,8 +84,31 @@ curl -s localhost:8400/api/v3/contents/generations/tasks \
 5. **RGV587 的根因是请求头不全**（不是限速/账号/IP）⇒ 请求头照 `biz-api::build_headers`
    逐字段对齐，`version: 0.2.0` 是写端点硬门槛，两者都有实证（`docs/UPSTREAM.md` §2）。
 6. **归属即安全**：跨 Key 读任务 ⇒ **本地 404、不发上游**（有变异自证用例钉住）。
+7. **容量不足不再硬 429**：落 `queued` 排队，等窗口自己提交（见 §3）；**只有**队列深度超限
+   才回 429 背压。重试**只覆盖"可证明未提交"的失败** —— 建任务是计费动作，"可能已提交"的重试
+   等于赌重复计费。
 
-## 3. 真实链路状态（2026-09-22 首测 ✅）
+## 3. 排队 / 重试 / 重启不丢（轻量实现）
+
+**没有引入任何独立队列组件**（无 Redis/Celery/独立表）：队列就是任务表里 `status='queued'`
+的记录，消费者是既有件 —— 后台协调器（默认开）与调用方的 GET。`queued` 本身是方舟契约里的
+合法初始态，所以**对外形态零改动**。
+
+| 关切 | 行为 |
+|---|---|
+| 容量不足（全冷却 / 额度尽 / 节奏窗） | 落 `queued` + **立即**返回 `cgt-…`（不再 429） |
+| 谁把它送上去 | 协调器每 `COORDINATOR_TICK`（默认 5s）出队；调用方 GET 也顺带推进一格 |
+| 重试范围 | 风控（RGV587）/ 额度尽 / 鉴权失效 / 铸造失败 / 会话失效 —— **都可证明未受理** |
+| 不重试范围 | 上游 5xx / 超时 / 未知业务码 ⇒ 照实回报错误，任务落 `failed`（绝不赌重复计费） |
+| 退避与上限 | 指数退避 `QUEUE_RETRY_BASE × 2^n`（上限 600s）；`SUBMIT_MAX_ATTEMPTS`（5）与 `TASK_TIMEOUT`（900s）双闸门封顶 |
+| 背压 | 排队深度 ≥ `QUEUE_MAX_DEPTH`（50）⇒ 429 + `Retry-After`（绝不无限囤积） |
+| 重启不丢 | `queued`/`running` 记录在任务库（≥7 天）；**账号额度计数与冷却也在库**（KV 快照）⇒ 不会把已用额度算成 0；上游 token 刻意不落盘（重启重铸，免费） |
+| 严格模式 | `SUBMIT_QUEUE_ENABLED=0` 回到"容量不足立即 429"（既有调用方口径不变） |
+
+对应用例：`tests/test_queue.py`（7 项）—— 排队→出队→成功、协调器无人查询也推进、
+风控换号重试、**含义不明的失败不重试**、背压 429、**跨进程重启后 queued 任务与额度计数都还在**。
+
+## 4. 真实链路状态（2026-09-22 首测 ✅）
 
 经本服务全链路真实跑通（实录：`docs/UPSTREAM.md` §7.1）：
 
@@ -102,19 +126,21 @@ curl -s localhost:8400/api/v3/contents/generations/tasks \
 
 ### 诚实边界（未完成，不许当已完成）
 
-- 🔴 **账号池的每日计数在进程内**（重启归零 ⇒ 可能超发）—— 待落 KV（下一轮首项）。
+- 队列**不做请求去重**：同一 `POST` 重发两次 = 两条独立任务（方舟原生同样不保证幂等）。
+- 队列吞吐受协调器**单轮串行推进**限制（一轮 = 每个非终态任务一次上游往返）；
+  多 worker 需要选主/租约去重（未实现）—— 当前部署模型是 `WORKERS=1`。
 - 第三方域名外链图作 i2v 首帧、失败态形态、产物 URL 有效期、额度错误形态：见 `docs/UPSTREAM.md` §9。
 - 镜像：CI 构建 + **推送前容器冒烟** + 推 GHCR（`ghcr.io/aicatfire/qwen`，版本/`latest`/`sha-` 三 tag）；
   **尚未部署到任何环境**；本机无 Docker ⇒ 本地构建冒烟未做（由 CI 的推送前冒烟兜住）。
 - `rehost`（产物转存）未实现（上游 URL 实测可直下，先透传）。
 - 严格 SDK 客户端若对 `degradations` 扩展报错，需要响应裁剪开关（未实现）。
 
-## 4. 相关技能
+## 5. 相关技能
 
 `seedance-protocol-adapter` · `site-api-to-protocol-adapter` · `multi-account-adapter-pool` ·
 `qwen-guest-identity-service`（访客身份，另一个方向）
 
-## 5. 发版（与姊妹仓同一套）
+## 6. 发版（与姊妹仓同一套）
 
 push `main` → 自增 patch（`v0.0.x`）→ 版本号写回 `app/__init__.py` → 构建镜像 →
 **容器内冒烟（不过不推）** → 推 GHCR（`ghcr.io/aicatfire/qwen`：版本 / `latest` / `sha-<7位>` 三 tag）

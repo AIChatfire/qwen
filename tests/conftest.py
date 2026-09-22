@@ -1,6 +1,7 @@
 """共享夹具：假上游（记录每个请求）+ 可注入的 Settings / Store / Pool / Client。
 
 零网络纪律：全部用例走 `httpx.MockTransport`，不发任何真实请求（含 DNS）。
+测试确定性：夹具里 **协调器关闭**（生产默认开启）—— 否则后台线程会与用例断言抢推进。
 """
 from __future__ import annotations
 
@@ -18,6 +19,10 @@ from app.upstream.qwen.client import QwenClient
 CDN_IMAGE = "https://cdn.qwenlm.ai/output/u/image_gen/m1/1.png"
 SUCCESS_URL = "https://cdn.qwenlm.ai/output/u/i2v/c/{task}.mp4?key=k"
 
+#: 风控信封（HTTP 200 + ret 数组）——服务端的"可证明未提交"失败样本
+RISK_BODY = {"ret": ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试"],
+             "data": {"url": "https://chat.qwen.ai/_____tmd_____/punish"}}
+
 
 class FakeQwen:
     """内存假上游：按路径分流，记录**每一个**收到的请求（供"上游实际收到什么"断言）。"""
@@ -31,6 +36,8 @@ class FakeQwen:
         #: 非 None 时，提交端点固定回这个 body（用于错误映射用例）
         self.submit_response: dict | None = None
         self.submit_status_code = 200
+        #: 提交端点的一次性失败队列（先到先消费；空了才走正常成功路径）
+        self.fail_submits: list[dict] = []
 
     # ------------------------------------------------------------ 断言工具
 
@@ -39,6 +46,9 @@ class FakeQwen:
 
     def bodies(self, path_prefix: str) -> list[dict]:
         return [json.loads(r.content) for r in self.calls(path_prefix)]
+
+    def cookies(self, path_prefix: str) -> list[str]:
+        return [r.headers.get("cookie", "") for r in self.calls(path_prefix)]
 
     # ------------------------------------------------------------ 假上游实现
 
@@ -50,6 +60,8 @@ class FakeQwen:
             return httpx.Response(
                 200, json={"success": True, "data": {"id": f"chat-{self.chat_seq}"}})
         if path == "/api/v2/chat/completions":
+            if self.fail_submits:
+                return httpx.Response(200, json=self.fail_submits.pop(0))
             if self.submit_response is not None:
                 return httpx.Response(self.submit_status_code, json=self.submit_response)
             self.task_seq += 1
@@ -100,6 +112,8 @@ def settings(tmp_path) -> Settings:
         submit_min_interval=0.0,
         daily_video_cap=3,
         account_wait_timeout=0.05,
+        coordinator_enabled=False,   # 测试确定性：不让后台线程抢推进
+        queue_retry_base=0.0,        # 排队重试不等待（用例内即时出队）
     )
 
 
