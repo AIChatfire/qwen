@@ -65,10 +65,15 @@ curl -s localhost:8400/api/v3/contents/generations/tasks \
 ### 测试
 
 ```bash
-/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 128 项，零网络
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 133 项，零网络
 /Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/ruff check .
 /Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python scripts/env_sync_check.py  # .env ⇄ 模板 一致性
 ```
+
+> 🔒 **公开仓纪律**：真实基础设施标识**一律不入库**（代理池地址 / 内网 IP / 账号上游 id /
+> 上游 task id / 任何凭据样态）—— 池地址只在 gitignored 的 `.env` 里，库内一律占位符
+> （`pool.example` / `token-service.example`）。这条有门禁：`tests/test_public_surface.py`
+> （主机名白名单 + 私网 IP + 凭据样态，白名单每条都要写理由）。
 
 > **配置两份文件的分工**：`.env.example` = 字段说明的权威来源（37 键，含代码默认与坑，进库）；
 > `.env` = 本机/部署机的真实取值（gitignored）。模板侧门禁在 `tests/test_env_contract.py`；
