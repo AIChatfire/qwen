@@ -224,6 +224,10 @@ GET /v1/models          # 无需 Authorization（能力探测要在填 Key 之�
 
 ## 6. 部署与环境变量（关键项）
 
+> 本节是**关键项速查**；**完整键表（37 个，含每个键的代码默认与坑）见 `.env.example`** ——
+> 它是字段说明的权威来源（新参数先加那里，再同步到 `.env`）。两份文件的一致性有门禁：
+> 模板侧 `tests/test_env_contract.py`（CI 可跑），生效文件侧 `scripts/env_sync_check.py`（`.env` 不入库，故只能是脚本）。
+
 | env | 默认 | 说明 |
 |---|---|---|
 | `QWEN_BASE_URL` | `https://chat.qwen.ai` | 上游 base |

@@ -65,9 +65,14 @@ curl -s localhost:8400/api/v3/contents/generations/tasks \
 ### 测试
 
 ```bash
-/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 94 项，零网络
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 128 项，零网络
 /Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/ruff check .
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python scripts/env_sync_check.py  # .env ⇄ 模板 一致性
 ```
+
+> **配置两份文件的分工**：`.env.example` = 字段说明的权威来源（37 键，含代码默认与坑，进库）；
+> `.env` = 本机/部署机的真实取值（gitignored）。模板侧门禁在 `tests/test_env_contract.py`；
+> 生效文件侧只能在有 `.env` 的机器上跑脚本（`.env` 不入库 ⇒ 写成测试就只能是假绿灯）。
 
 ---
 
