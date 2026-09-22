@@ -29,9 +29,22 @@
 ## 1. 鉴权
 
 - `Authorization: Bearer <API Key>`；**未配置 `API_KEYS` 时鉴权关闭**（仅限内网部署，显式声明）。
-- 任务与 Key **绑定**：任务记录里存 `credential_id = HMAC-SHA256(secret, key)` 指纹
-  （永不落明文）。**换一把 Key 读同一任务 ⇒ 本地直接 404，且不发任何上游请求**。
-- 缺失/无效 Key ⇒ `401 AuthenticationError`。
+- 🔴 **创建（POST）必须带 Key；查询（GET 单条）不强制**（2026-09-22 修订，同 `../jimeng` 口径）：
+
+  | 请求 | 行为 |
+  |---|---|
+  | `POST /tasks` | **必须**带有效 Key（缺失/无效 ⇒ 401） |
+  | `GET /tasks/{id}` **不带** `Authorization` | ✅ **放行** —— `id` 本身就是凭据（调用方可把结果链接直接分享出去） |
+  | `GET /tasks/{id}` 带**无效** Key | ❌ 401 —— 不因为"反正放行"就把配置错误静默吞掉（那是最难查的一类问题） |
+  | `GET /tasks/{id}` 带**有效但非属主**的 Key | ❌ 404 —— 比 `jimeng` **严一档**，保留"跨 Key 读不到"（ADR-003） |
+  | `GET /v1/models` | ✅ 免 Key（能力探测先于填 Key） |
+  | `GET /healthz` `/readyz` `/stats` | ✅ 免 Key（运维面；⚠️ 上反代时**必须**挡住 `/stats`，它含账号用量与冷却） |
+
+- 任务与创建 Key **绑定**：任务记录里存 `credential_id = HMAC-SHA256(secret, key)` 指纹
+  （永不落明文）。**带上 Key 读别人的任务 ⇒ 本地直接 404，且不发任何上游请求**。
+- ⚠️ 既然 GET 免 Key，`task_id` 的**不可猜性**就成了安全前提：当前格式为
+  `cgt-<UTC 秒>-<5 位随机>`（≈29.8 bit 熵）。**待办**：把随机段加长到 ≥16 位再对外大面积开放
+  （见 `docs/UPSTREAM.md` 的登记；本机部署当前只绑回环，暂无暴露面）。
 
 ---
 

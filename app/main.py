@@ -123,6 +123,25 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
             raise AuthenticationError("API Key 无效")
         return fingerprint(secret, key)
 
+    def credential_id_optional(request: Request) -> str | None:
+        """**可选的**调用方 Key —— 只给「按 id 即凭据」的**读单条任务**用。
+
+        三种情况分得很清（刻意不合并，与 `../jimeng` 同口径）：
+
+        · **完全没带** `Authorization` ⇒ 返回 `None`，**放行**。
+          理由：`task_id` 只在受理时返回给带 Key 的调用方，调用方可以把结果链接直接分享出去；
+        · **带了但无效**（不在白名单）⇒ **照旧 401** —— 不能因为"反正放行"就把错的 Key
+          蒙过去，那会让调用方的配置错误被静默吞掉（最难查的一类问题）；
+        · **带了且有效、但不是该任务的属主** ⇒ 返回该指纹，由 `service.get` 判 404。
+          ⚠️ 这里比 `jimeng` **严一档**：jimeng 对"非属主"与"没带"同一待遇（都放行），
+          本服务保留**跨 Key 读 ⇒ 404**（ADR-003 口径）—— 不冲突：调用方要么不带 Key，
+          要么用原 Key 读；而"拿着甲 Key 去探乙 Key 的任务"仍然读不到。
+        """
+        authorization = request.headers.get("authorization", "").strip()
+        if not authorization:
+            return None
+        return credential_id_of(request)
+
     @app.post("/api/v3/contents/generations/tasks")
     async def create_generation_task(request: Request):
         credential_id = credential_id_of(request)
@@ -138,7 +157,11 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
 
     @app.get("/api/v3/contents/generations/tasks/{task_id}")
     async def get_generation_task(task_id: str, request: Request):
-        credential_id = credential_id_of(request)
+        """查询任务 —— **不强制 Key：`task_id` 本身就是凭据**（方舟语义，同 `../jimeng`）。
+
+        带了 Key 才按归属过滤（不匹配 ⇒ 404，防跨 Key 探测）；完全没带 ⇒ 直接按 id 读。
+        """
+        credential_id = credential_id_optional(request)
         result = await asyncio.to_thread(service.get, task_id, credential_id)
         return JSONResponse(status_code=200, content=result)
 

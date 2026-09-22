@@ -238,10 +238,19 @@ class QwenVideoService:
 
     # ------------------------------------------------------------------ 查询
 
-    def get(self, local_id: str, credential_id: str) -> dict:
+    def get(self, local_id: str, credential_id: str | None) -> dict:
+        """按 id 读任务。
+
+        `credential_id is None` ⇒ **免鉴权读**（`task_id` 本身即凭据，方舟语义，同 `../jimeng`：
+        调用方可以把结果链接直接分享出去）；给了指纹 ⇒ 走**归属校验**，不匹配一律本地 404
+        **且不发上游**（ADR-003：放行到上游就是用错的钥匙去查，返回的 404/空无法区分
+        "任务真没了"与"钥匙不对"）。
+        """
         record = self.store.get(local_id)
-        if record is None or record.credential_id != credential_id:
-            # 归属不符 ⇒ 本地直接 404，**根本不发上游请求**（ADR-003 口径）
+        if record is None:
+            raise NotFoundError(f"任务 {local_id} 不存在")
+        if credential_id is not None and record.credential_id != credential_id:
+            # 归属不符 ⇒ 本地直接 404（不带 Key 的读不需要走这里）
             raise NotFoundError(f"任务 {local_id} 不存在")
         if record.status not in TERMINAL_STATUSES:
             record = self.advance_record(record)

@@ -82,6 +82,7 @@ def test_get_polls_until_success_then_stops_touching_upstream(client_app):
 
 
 def test_other_key_gets_404_with_zero_upstream_calls(client_app):
+    """带了**有效但非属主**的 Key ⇒ 本地 404、零上游（比 jimeng 严一档，保留 ADR-003）。"""
     tc, fake, store, settings = client_app
     task_id = post(client_app).json()["id"]
     before = len(fake.requests)
@@ -89,6 +90,28 @@ def test_other_key_gets_404_with_zero_upstream_calls(client_app):
     assert resp.status_code == 404
     assert len(fake.requests) == before        # 本地拦下：根本没问上游
     assert resp.json()["error"]["code"] == "InvalidEndpointOrModel.NotFound"
+
+
+def test_get_without_any_key_is_allowed(client_app):
+    """查询**不强制 Key**：`task_id` 本身就是凭据（方舟语义，同 `../jimeng`）。
+
+    调用方可以把结果链接直接分享出去 —— 不带 `Authorization` 也能读。
+    """
+    tc, fake, store, settings = client_app
+    task_id = post(client_app).json()["id"]
+    resp = tc.get(f"{TASKS_PATH}/{task_id}")            # 刻意不带 Authorization
+    assert resp.status_code == 200
+    assert resp.json()["id"] == task_id
+    assert resp.json()["status"] in ("queued", "running")   # 顺带推进也照常工作
+
+
+def test_get_with_invalid_key_is_still_401(client_app):
+    """带了但**无效**的 Key ⇒ 照旧 401 —— 不因为"反正放行"把调用方的配置错误静默吞掉。"""
+    tc, *_ = client_app
+    task_id = post(client_app).json()["id"]
+    resp = tc.get(f"{TASKS_PATH}/{task_id}", headers={"Authorization": "Bearer sk-nope"})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "AuthenticationError"
 
 
 def test_unknown_key_is_401(client_app):
