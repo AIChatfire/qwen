@@ -1,0 +1,122 @@
+# qwen-service
+
+chat.qwen.ai 视频生成（**t2v / i2v**）的**火山方舟 Seedance 契约出口**：
+多账号池（登录态最小凭据）+ 完整浏览器指纹请求头 + 惰性轮询，
+一条 `cgt-…` 任务贯穿创建与查询。调用方**只换 Base URL + Key** 即可接入。
+
+```
+POST /api/v3/contents/generations/tasks        → 200 {"id": "cgt-…"}   创建（只回 id）
+GET  /api/v3/contents/generations/tasks/{id}   → 200 方舟任务对象        查询（六态）
+GET  /healthz · /readyz · /stats                                      运维面（无凭据原文）
+```
+
+- **对外契约全文**：**[`docs/INTERFACE.md`](docs/INTERFACE.md)**（冻结）
+- **上游契约**：**[`docs/UPSTREAM.md`](docs/UPSTREAM.md)**（qwen 网页端唯一真源）
+
+---
+
+## 0. 我要做什么 → 看哪个文件
+
+| 我想… | 看这里 |
+|---|---|
+| 接这个服务（方舟 SDK 客户端） | `docs/INTERFACE.md` |
+| 改 qwen 请求头 / 请求体 / 响应判读 | `app/upstream/qwen/client.py` |
+| 改"多账号怎么轮换、冷却、计额度" | `app/upstream/qwen/accounts.py` |
+| 改登录铸造（signin / 轮换出口） | `app/upstream/qwen/signin.py` |
+| 改方舟 ↔ qwen 的翻译与降级口径 | `app/ark.py`（纯函数，测试主战场） |
+| 改任务存取 | `app/store.py`（SQLModel；SQLite 默认 / PostgreSQL 可选） |
+| 改对外鉴权与路由 | `app/main.py` |
+| 改上游有没有这个能力 / 未证实项 | `docs/UPSTREAM.md` |
+
+---
+
+## 1. 跑起来
+
+```bash
+cp .env.example .env
+# 填：QWEN_ACCOUNTS（多账号）、QWEN_ACCOUNT_PASSWORD、QWEN_SIGNIN_SOCKS（轮换出口，必填）
+docker compose up -d --build
+curl -s localhost:8400/readyz
+```
+
+本机直接跑（用仓内 venv）：
+
+```bash
+export QWEN_ACCOUNTS='a@x.cn,b@x.cn' QWEN_ACCOUNT_PASSWORD='…'
+export QWEN_SIGNIN_SOCKS='socks5h://user:pass@pool.example:2088'   # signin 必须走轮换出口
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/gunicorn \
+  -c gunicorn_conf.py "app.main:create_app()"
+```
+
+🔴 末尾那对**括号不能省**：目标是**工厂**而不是模块级 `app` 对象。
+写成 `app.main:app` 会得到 `App failed to load.`（`tests/test_wiring.py` 钉住这条）。
+
+### 零成本自检（不提交、不落库）
+
+```bash
+curl -s localhost:8400/api/v3/contents/generations/tasks \
+  -H 'Authorization: Bearer <key>' -H 'X-Avm-Dry-Run: 1' \
+  -d '{"model":"qwen/video","content":[{"type":"text","text":"一只猫"}],"ratio":"16:9"}'
+# → 返回"将要发出的请求"（上游 URL / 完整头（Cookie 打码）/ body）
+```
+
+### 测试
+
+```bash
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 84 项，零网络
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/ruff check .
+```
+
+---
+
+## 2. 冻结决策（2026-09-22）
+
+1. **范围 = 创建 + 查询两个核心端点**；列表 / DELETE **刻意不实现**（路由不存在，
+   不返回空列表之类的假数据）。回调 v1 不实现（`callback_url` 进 `degradations`）。
+2. **创建响应逐字 `{"id": …}`**；查询响应 = 白名单 ∧ 有真值：
+   不出现 `resolution` / `seed` / `usage` 等（不编"看起来合理"的常量）；
+   `degradations` 是**加性扩展**（仅非空时出现）。
+3. **容量语义 = 3 次/天/账号（UTC 日，t2v+i2v 共用）** ⇒ 账号池按 UTC 日计数 + 冷却 +
+   提交节奏（`QWEN_SUBMIT_MIN_INTERVAL`）。真实天花板 = 账号数 × 3。
+4. **凭据 = 登录态最小凭据**（`Cookie: token=<JWT>`），signin **必须走轮换出口**；
+   每账号 token 分格缓存（互不挤掉），任务记录只存 `credential_id` 指纹。
+5. **RGV587 的根因是请求头不全**（不是限速/账号/IP）⇒ 请求头照 `biz-api::build_headers`
+   逐字段对齐，`version: 0.2.0` 是写端点硬门槛，两者都有实证（`docs/UPSTREAM.md` §2）。
+6. **归属即安全**：跨 Key 读任务 ⇒ **本地 404、不发上游**（有变异自证用例钉住）。
+
+## 3. 真实链路状态（2026-09-22 首测 ✅）
+
+经本服务全链路真实跑通（实录：`docs/UPSTREAM.md` §7.1）：
+
+| 步骤 | 结果 |
+|---|---|
+| signin（经轮换出口 2088） | ✅ `token_len=209` / 4.3s |
+| dry-run | ✅ 零成本，头与 body 与抓包同构 |
+| **t2v 真跑** | ✅ `cgt-20260922012530-tyoa9`：≈343s，产物 5.50MB / **5.042s** |
+| **i2v 真跑**（上游样例图作首帧） | ✅ `cgt-20260922013158-ae0tq`：≈93s，产物 9.59MB / **5.042s** |
+
+- 账号轮换实证：两条任务落在**两个不同账号**（各消耗 1/3 日额度；产物 URL 的 `resource_user_id` 不同）。
+- 未证实项变化：**U-7 ✅ 关闭**（token 最小凭据跑通视频写端点）；**U-1 🟡 部分关闭**
+  （上游域内图 ✅；第三方外链未验）。
+- 冒烟驱动：`scripts/live_smoke.py signin|dryrun|run --kind t2v|i2v`（`run` 会消耗额度）。
+
+### 诚实边界（未完成，不许当已完成）
+
+- 🔴 **账号池的每日计数在进程内**（重启归零 ⇒ 可能超发）—— 待落 KV（下一轮首项）。
+- 第三方域名外链图作 i2v 首帧、失败态形态、产物 URL 有效期、额度错误形态：见 `docs/UPSTREAM.md` §9。
+- 镜像：CI 构建 + **推送前容器冒烟** + 推 GHCR（`ghcr.io/aicatfire/qwen`，版本/`latest`/`sha-` 三 tag）；
+  **尚未部署到任何环境**；本机无 Docker ⇒ 本地构建冒烟未做（由 CI 的推送前冒烟兜住）。
+- `rehost`（产物转存）未实现（上游 URL 实测可直下，先透传）。
+- 严格 SDK 客户端若对 `degradations` 扩展报错，需要响应裁剪开关（未实现）。
+
+## 4. 相关技能
+
+`seedance-protocol-adapter` · `site-api-to-protocol-adapter` · `multi-account-adapter-pool` ·
+`qwen-guest-identity-service`（访客身份，另一个方向）
+
+## 5. 发版（与姊妹仓同一套）
+
+push `main` → 自增 patch（`v0.0.x`）→ 版本号写回 `app/__init__.py` → 构建镜像 →
+**容器内冒烟（不过不推）** → 推 GHCR（`ghcr.io/aicatfire/qwen`：版本 / `latest` / `sha-<7位>` 三 tag）
+→ 打 annotated tag → 建 Release。人工 tag（minor/major）走 tag 模式（**不改代码**）；
+逃生阀：commit message 含 `[skip release]`（仅 push 事件生效，补发用 `workflow_dispatch`）。

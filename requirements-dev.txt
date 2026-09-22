@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# --- 测试
+# 与 .workbuddy/binaries/python/envs/qwen 本机环境对齐（本地通过 = CI 通过）
+pytest==9.1.1
+
+# --- 静态门禁
+# 只启用**能抓真缺陷**的规则集，刻意不收风格规则（见 ruff.toml）。
+ruff==0.16.8

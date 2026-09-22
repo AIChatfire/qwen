@@ -1,0 +1,11 @@
+services:
+  qwen:
+    build: .
+    image: qwen-service:local
+    env_file: [.env]
+    ports:
+      - "8400:8400"
+    volumes:
+      # SQLite 任务库 + hmac 密钥落在宿主（跨镜像重建保留；任务记录 ≥7 天硬要求）
+      - ./var:/app/var
+    restart: unless-stopped

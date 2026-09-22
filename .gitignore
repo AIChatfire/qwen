@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+var/
+.pytest_cache/
+.ruff_cache/
+reports/
+.workbuddy/
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# 抓包重放脚本（含真实会话令牌，不入库）
+scripts/captured/
