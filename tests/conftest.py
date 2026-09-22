@@ -23,6 +23,10 @@ SUCCESS_URL = "https://cdn.qwenlm.ai/output/u/i2v/c/{task}.mp4?key=k"
 RISK_BODY = {"ret": ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试"],
              "data": {"url": "https://chat.qwen.ai/_____tmd_____/punish"}}
 
+#: 401 信封（HTTP 200 + 业务码）——"token 提前失效"的样本，用于续期兜底用例
+UNAUTHORIZED_BODY = {"success": False,
+                     "data": {"code": "Unauthorized", "details": "您没有权限访问此资源"}}
+
 
 class FakeQwen:
     """内存假上游：按路径分流，记录**每一个**收到的请求（供"上游实际收到什么"断言）。"""

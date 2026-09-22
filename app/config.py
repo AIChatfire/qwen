@@ -104,7 +104,11 @@ class Settings:
     account_cookies: dict[str, str] = field(default_factory=dict)
     signin_socks: str = ""
     token_url: str = ""
-    token_ttl: float = 6 * 86400.0
+    #: token 缓存**上限**（秒）—— 主动续期取 `min(JWT 的 exp - 提前量, 铸后本值)`。
+    #: 🔴 为什么不能只看 `exp`：`exp` 是上游**自称**的（实测 30 天），服务端可能提前失效
+    #: （自称 30 天、实际 7 天就判 401 是有先例的形态）⇒ 用一个保守上限把它压住，默认 **1 天**。
+    #: `0` = 不设上限（完全按 `exp`，仅在对上游行为有把握时用）；token 无 `exp` 时本值即兜底缓存时长。
+    token_ttl: float = 86400.0
     signin_min_interval: float = 45.0
     signin_wait_timeout: float = 45.0
     submit_min_interval: float = 15.0
@@ -151,7 +155,7 @@ class Settings:
             account_cookies=parse_account_cookies(env),
             signin_socks=_env(env, "QWEN_SIGNIN_SOCKS"),
             token_url=_env(env, "QWEN_TOKEN_URL"),
-            token_ttl=_num(env, "QWEN_TOKEN_TTL", 6 * 86400.0),
+            token_ttl=_num(env, "QWEN_TOKEN_TTL", 86400.0),
             signin_min_interval=_num(env, "QWEN_SIGNIN_MIN_INTERVAL", 45.0),
             signin_wait_timeout=_num(env, "QWEN_SIGNIN_WAIT_TIMEOUT", 45.0),
             submit_min_interval=_num(env, "QWEN_SUBMIT_MIN_INTERVAL", 15.0),

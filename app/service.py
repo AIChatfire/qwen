@@ -20,6 +20,8 @@ import random
 import string
 import threading
 import time
+from collections.abc import Callable
+from typing import Any
 
 from .ark import CreatePlan, ark_task_view, translate_ark_create
 from .config import Settings
@@ -131,6 +133,27 @@ class QwenVideoService:
     def _extra_cookies(self, email: str) -> str:
         return (self.settings.account_cookies or {}).get(email, "")
 
+    def _authed_call(self, email: str, fn: Callable[[str], Any]) -> Any:
+        """带该账号的 token 调用 `fn(token)`；**判 401 时立即重铸 token 并重试一次**。
+
+        这是"token 提前失效"的**兜底**：`exp` 是上游**自称**的（实测 30 天），服务端完全可能更早失效
+        ⇒ 与其等下一次调用，不如当场重铸重试。判据也成立：401 = 上游**未受理**，重试不会重复计费。
+
+        只重试**一次**：第二次仍 401 ⇒ 不是"token 过期"，而是凭据/账号本身的问题 ⇒
+        `report_failure(auth)`（冷却 900s）后照实上抛。
+        """
+        attempts = 2
+        for attempt in range(1, attempts + 1):
+            token = self.pool.token_for(email)
+            try:
+                return fn(token)
+            except AuthenticationError:
+                if attempt == attempts:
+                    self.pool.report_failure(email, "auth")
+                    raise
+                logger.warning("上游判 401 —— 立即重铸 token 并重试一次（%s）", mask_email(email))
+                self.pool.invalidate_token(email)
+
     def _submit_once(self, plan: CreatePlan, account: AccountState, credential_id: str,
                      record: TaskRecord | None = None) -> TaskRecord:
         """在指定账号上提交一次；成功即落库（`record` 为空则新建一条）。
@@ -139,16 +162,20 @@ class QwenVideoService:
         """
         email = account.email
         extra = self._extra_cookies(email)
-        token = self.pool.token_for(email)
-        chat_id = self._chat_id_for(account, token, extra)
-        try:
-            task_id = self._submit(token, chat_id, plan, extra)
-        except NotFoundError:
-            # 会话可能被上游回收（"CHAT_NOT_FOUND"）—— 重建一次，只重试这一种
-            logger.warning("chat_id 失效，重建后重试一次（%s）", mask_email(email))
-            self.store.kv_delete(f"chat:{email}")
+
+        def attempt(token: str) -> tuple[str, str]:
+            """token → (task_id, chat_id)；会话被上游回收时重建一次（`CHAT_NOT_FOUND`）。"""
             chat_id = self._chat_id_for(account, token, extra)
-            task_id = self._submit(token, chat_id, plan, extra)
+            try:
+                return self._submit(token, chat_id, plan, extra), chat_id
+            except NotFoundError:
+                # 会话可能被上游回收（"CHAT_NOT_FOUND"）—— 重建一次，只重试这一种
+                logger.warning("chat_id 失效，重建后重试一次（%s）", mask_email(email))
+                self.store.kv_delete(f"chat:{email}")
+                chat_id = self._chat_id_for(account, token, extra)
+                return self._submit(token, chat_id, plan, extra), chat_id
+
+        task_id, chat_id = self._authed_call(email, attempt)
 
         self.pool.report_submitted(email)
         now = int(time.time())
@@ -293,6 +320,30 @@ class QwenVideoService:
 
     # ------------------------------------------------------------------ 轮询
 
+    def _task_status_with_remint(self, email: str, upstream_task_id: str,
+                                 extra: str) -> tuple[dict, int, dict]:
+        """查询任务；**被判 401 时重铸 token 再试一次**（查询只读 ⇒ 重试零风险、零额度）。
+
+        两次都 401 ⇒ 不是"token 过期"而是账号/凭据问题 ⇒ 冷却 900s + 503
+        （**部署问题，不是调用方 Key 的错** —— 混淆会让对方去改自己的请求）。
+        """
+        token = self.pool.token_for(email)
+        result = self.client.task_status(token, upstream_task_id, extra_cookies=extra)
+        actual = int(result["actual_status_code"])
+        data: dict = result["data"] or {}
+        if actual == 401 or data.get("code") == "Unauthorized":
+            logger.warning("查询被判 401 —— 重铸 token 后重试一次（%s）", mask_email(email))
+            self.pool.invalidate_token(email)
+            token = self.pool.token_for(email)
+            result = self.client.task_status(token, upstream_task_id, extra_cookies=extra)
+            actual = int(result["actual_status_code"])
+            data = result["data"] or {}
+            if actual == 401 or data.get("code") == "Unauthorized":
+                self.pool.report_failure(email, "auth")
+                raise CredentialUnavailableError(
+                    "上游持续判 401（已重铸 token 重试一次）—— 账号凭据/账号状态问题")
+        return result, actual, data
+
     def poll_record(self, record: TaskRecord) -> TaskRecord:
         """回查上游一次并落库。**不改写非终态之外的语义**：解析不出来按失败报。"""
         now = int(time.time())
@@ -306,16 +357,9 @@ class QwenVideoService:
             record.error_message = "任务所属账号不在当前配置中"
             return self.store.put(record)
 
-        token = self.pool.token_for(account.email)
         extra = self._extra_cookies(account.email)
-        result = self.client.task_status(token, record.upstream_task_id, extra_cookies=extra)
-        actual = int(result["actual_status_code"])
-        data: dict = result["data"] or {}
-
-        if actual == 401 or data.get("code") == "Unauthorized":
-            self.pool.invalidate_token(account.email)
-            self.pool.report_failure(account.email, "auth")
-            raise CredentialUnavailableError("上游 401 —— 账号 token 已失效（已标记重铸后重试）")
+        result, actual, data = self._task_status_with_remint(
+            account.email, record.upstream_task_id, extra)
 
         if actual == 404 or data.get("code") == "Not_Found":
             record.status = "failed"

@@ -50,8 +50,15 @@ GET  /api/v2/task/status/<task_id>            → data.task_status / data.conten
 ✅ **2026-09-22 再证（视频写端点）**：本服务用同一份最小凭据（`Cookie: token=<JWT>`，无 bx-*、
 无其他 cookie）真实跑通 **t2v 与 i2v** 两条链路（见 §7.1）—— U-7 由此关闭。
 
-- token 是**无状态 JWT**（实测：`token_len=209`；签发后 27 分钟仍被接受；缓存 TTL 取 6 天，
-  对照实测寿命 30 天）。
+- token 是**无状态 JWT**（实测：`token_len=209`；签发后 27 分钟仍被接受）。
+  **载荷只有三个键：`{exp, id, last_password_change}`（没有 `iat`）**，`id` 即账号 id，
+  实测 `exp` = **铸后 30 天**（2026-09-22 现铸解析：`2592000` 秒）。
+- 🔴 **`exp` 只是上游"自称"，不得当真实寿命用**：服务端可能提前失效（自称 30 天、实际 7 天就被判 401
+  是有先例的形态）。本仓口径（2026-09-22 起）：
+  **主动**续期 = `min(exp − 提前量, 铸后 QWEN_TOKEN_TTL)`，提前量 = 生命的 10%（夹在 1 分钟 ~ 6 小时），
+  `QWEN_TOKEN_TTL` 默认 **1 天**（保守上限，`0` = 不设上限）；
+  **被动**兜底 = 上游判 401 ⇒ 清缓存 → **立即重铸 → 原请求重试一次**（写端点同样重试：
+  401 = 上游未受理，不会重复计费）。两条路都在 `app/upstream/qwen/accounts.py` + `app/service.py::_authed_call`。
 - token 由 `POST /api/v2/auths/signin` 铸造：body `{"email", "password": sha256hex(password)}`，
   token **只在 `Set-Cookie`**（body 是账号记录，没有 token）。✅ 2026-09-22 经池复现（4.3s/账号）。
 - 🔴 **signin 有 IP 级频率墙**：同出口几秒内连登多个账号 ⇒ `aliyun_waf` 挑战页 ⇒

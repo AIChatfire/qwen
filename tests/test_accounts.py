@@ -1,12 +1,20 @@
 """账号池：轮换 / 额度（UTC 日）/ 冷却 / token 分格缓存 / 脱敏。零网络（mint 注入）。"""
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
 
 from app.errors import CredentialUnavailableError, RateLimitedError
-from app.upstream.qwen.accounts import AccountPool, mask_email, next_utc_midnight
+from app.upstream.qwen.accounts import (
+    OPAQUE_TOKEN_TTL,
+    AccountPool,
+    jwt_exp,
+    mask_email,
+    needs_refresh,
+    next_utc_midnight,
+)
 
 
 class Clock:
@@ -201,3 +209,96 @@ def test_on_change_callback_fires_and_its_failure_is_contained(settings):
     pool.on_change = boom
     pool.report_submitted(account.email)     # 不抛异常
     assert pool.get_state(account.email).day_used == 2
+
+
+# ---------------------------------------------------------------- token 过期续期
+
+
+def _jwt(exp: float) -> str:
+    """造一个只带 `exp` 的 JWT（本仓只解码调度，不验签）。"""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": exp, "id": "acct"}).encode()).decode().rstrip("=")
+    return f"h.{payload}.s"
+
+
+def test_jwt_exp_parses_and_is_lenient():
+    assert jwt_exp(_jwt(1_792_659_003)) == 1_792_659_003.0
+    assert jwt_exp("not-a-jwt") is None            # 不透明 token
+    assert jwt_exp("a.!!!.c") is None              # 坏 base64
+    assert jwt_exp("a.eyJpZCI6IngifQ.b") is None   # 没有 exp 键
+    assert jwt_exp("") is None
+
+
+def test_self_declared_exp_is_capped_by_ttl():
+    """🔴 `exp` 是上游**自称**的（实测 30 天）⇒ 必须有保守上限压住，不能拿自称当真实寿命。"""
+    minted = 1_000_000.0
+    exp = minted + 30 * 86400
+    assert not needs_refresh(minted_at=minted, expires_at=exp, ttl=86400.0, now=minted + 3600)
+    assert needs_refresh(minted_at=minted, expires_at=exp, ttl=86400.0, now=minted + 86400)
+
+
+def test_exp_drives_refresh_when_cap_disabled():
+    """`ttl=0` ⇒ 不设上限，完全按 `exp`（提前量 = 生命的 10%，**上限 6 小时**）。"""
+    minted = 1_000_000.0
+    exp = minted + 30 * 86400
+    assert not needs_refresh(minted_at=minted, expires_at=exp, ttl=0.0, now=minted + 20 * 86400)
+    assert not needs_refresh(minted_at=minted, expires_at=exp, ttl=0.0, now=exp - 6 * 3600 - 1)
+    assert needs_refresh(minted_at=minted, expires_at=exp, ttl=0.0, now=exp - 6 * 3600)
+
+
+def test_opaque_token_falls_back_to_ttl_then_default():
+    """非 JWT（不透明 token，如外部 token 服务）⇒ 按 `ttl`；`ttl` 也给 0 则兜底 6 小时。"""
+    minted = 1_000_000.0
+    assert not needs_refresh(minted_at=minted, expires_at=0.0, ttl=7200.0, now=minted + 3600)
+    assert needs_refresh(minted_at=minted, expires_at=0.0, ttl=7200.0, now=minted + 7200)
+    assert not needs_refresh(minted_at=minted, expires_at=0.0, ttl=0.0, now=minted + OPAQUE_TOKEN_TTL - 1)
+    assert needs_refresh(minted_at=minted, expires_at=0.0, ttl=0.0, now=minted + OPAQUE_TOKEN_TTL)
+
+
+def test_pool_reuses_exp_bearing_token_until_near_expiry(settings):
+    """池的真实行为：`ttl=0` 时按 `exp` 判定 —— 第 20 天仍复用，进到提前量（≤6h）才重铸。"""
+    settings.token_ttl = 0.0
+    settings.signin_min_interval = 0.0
+    clock = Clock()
+    mints: list[str] = []
+    pool = AccountPool(settings, mint=lambda a: (mints.append(a.email),
+                                                 _jwt(clock.t + 30 * 86400))[1], now=clock)
+    pool.token_for("a@x.cn")
+    clock.t += 20 * 86400
+    pool.token_for("a@x.cn")
+    assert len(mints) == 1                      # 还剩 10 天 ≫ 提前量 ⇒ 复用
+    assert pool.stats()["accounts"][0]["token_cached"] is True
+    clock.t += 9 * 86400 + 86400 - 3600         # 走到 exp 前 1 小时（已进提前量）
+    pool.token_for("a@x.cn")
+    assert len(mints) == 2
+
+
+def test_pool_caps_cache_at_token_ttl(settings):
+    """默认口径（`ttl=1 天`）：即便 token 自称 30 天，也诚实按 1 天换 —— 上游可能提前失效。"""
+    settings.token_ttl = 86400.0
+    settings.signin_min_interval = 0.0
+    clock = Clock()
+    mints: list[str] = []
+    pool = AccountPool(settings, mint=lambda a: (mints.append(a.email),
+                                                 _jwt(clock.t + 30 * 86400))[1], now=clock)
+    pool.token_for("a@x.cn")
+    clock.t += 86399
+    pool.token_for("a@x.cn")
+    assert len(mints) == 1
+    clock.t += 2                                # 越过 1 天上限
+    pool.token_for("a@x.cn")
+    assert len(mints) == 2
+    assert pool.get_state("a@x.cn").expires_at == pytest.approx(clock.t - 2 + 30 * 86400)
+
+
+def test_invalidate_and_auth_failure_clear_expiry(settings):
+    """被动路径：清缓存时必须连 `expires_at` 一起清，否则"复用"判定会拿旧到期时间放行。"""
+    pool = make_pool(settings, Clock(), mint=lambda a: _jwt(1_792_659_003))
+    pool.token_for("a@x.cn")
+    assert pool.get_state("a@x.cn").expires_at > 0
+    pool.invalidate_token("a@x.cn")
+    assert pool.get_state("a@x.cn").expires_at == 0.0
+
+    pool.token_for("a@x.cn")
+    pool.report_failure("a@x.cn", "auth")
+    assert pool.get_state("a@x.cn").expires_at == 0.0

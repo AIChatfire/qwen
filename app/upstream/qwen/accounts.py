@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import threading
 import time
@@ -54,12 +56,65 @@ def mask_email(email: str) -> str:
     return f"{head}***@{domain}" if domain else f"{head}***"
 
 
+# ---------------------------------------------------------------- token 续期口径
+
+#: 续期提前量：token 生命的 10%，夹在 [1 分钟, 6 小时] —— 不"卡着最后一秒"用过期 token。
+REFRESH_MARGIN_RATIO = 0.1
+REFRESH_MARGIN_MIN = 60.0
+REFRESH_MARGIN_MAX = 6 * 3600.0
+
+
+def jwt_exp(token: str) -> float | None:
+    """从 JWT 载荷取 `exp`（**不验签** —— 只用于调度续期，不参与任何信任判定）。
+
+    实测（2026-09-22）：qwen 的 token `exp` = 铸后 **30 天**、载荷键为 `{exp, id, last_password_change}`
+    （**没有 `iat`**）。
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return float(exp) if exp else None
+    except Exception:  # noqa: BLE001 - 任何异常都视为"这个 token 没有可解析的 exp"
+        return None
+
+
+#: 没有 `exp` 的不透明 token 的兜底缓存时长（6 小时）——只在外部 token 服务形态下用到。
+OPAQUE_TOKEN_TTL = 6 * 3600.0
+
+
+def needs_refresh(minted_at: float, expires_at: float, ttl: float, now: float) -> bool:
+    """要不要重新铸造 token。
+
+    判定 = **以 JWT 的 `exp` 为准（留提前量）** ∧ **不超过 `ttl` 这个保守上限**：
+
+      · `exp` 是**上游自称**的有效期 —— 实测 qwen 是 30 天，但**自称不等同于服务端真实行为**
+        （服务端可能提前失效，例如自称 30 天、实际 7 天就判 401）⇒ 所以**必须再加一个保守缓存上限**
+        （`QWEN_TOKEN_TTL`，默认 1 天），不能把自称当真；
+      · `ttl <= 0` ⇒ 不设上限，完全按 `exp`（只在对上游行为有把握时才这么配）；
+      · 没有 `exp`（不透明 token，如外部 token 服务）⇒ 用 `ttl`（再兜底 `OPAQUE_TOKEN_TTL`）。
+
+    ⚠️ **真正兜底的不是本函数，而是被动路径**：上游一旦判 401 ⇒ 清缓存 → **立即重铸 → 原请求重试一次**
+    （见 `app/service.py::_authed_call`）。所以本函数只需"别太频繁换"，'换得太晚'由上一条兜住。
+    """
+    if expires_at:
+        life = max(expires_at - minted_at, 1.0)
+        margin = min(max(life * REFRESH_MARGIN_RATIO, REFRESH_MARGIN_MIN), REFRESH_MARGIN_MAX)
+        deadline = expires_at - margin
+        if ttl > 0:
+            deadline = min(deadline, minted_at + ttl)
+        return now >= deadline
+    return (now - minted_at) >= (ttl if ttl > 0 else OPAQUE_TOKEN_TTL)
+
+
 @dataclass
 class AccountState:
     email: str
     password: str
     token: str = ""
     minted_at: float = 0.0
+    #: 该 token 的到期时刻（取自 JWT 的 `exp`；取不到则 0 ⇒ 按 `token_ttl` 兜底）
+    expires_at: float = 0.0
     cooldown_until: float = 0.0
     cooldown_reason: str = ""
     day: str = ""
@@ -170,14 +225,26 @@ class AccountPool:
                 time.sleep(wait)
             self._last_signin_at = self._now()
 
+    def _fresh(self, account: AccountState, now: float) -> bool:
+        """缓存里的 token 是否还在可复用窗口内（纯判定：不铸造、不加锁）。"""
+        return bool(account.token) and not needs_refresh(
+            minted_at=account.minted_at, expires_at=account.expires_at,
+            ttl=self.settings.token_ttl, now=now)
+
     def token_for(self, email: str) -> str:
-        """取（必要时铸造）该账号的 token。失败抛 `CredentialUnavailableError`。"""
+        """取（必要时铸造）该账号的 token。失败抛 `CredentialUnavailableError`。
+
+        **过期自动续期**走两条路（缺一不可）：
+          ① **主动**：按 token 自己的 `exp`（留提前量）在到期前重铸 —— `needs_refresh()`；
+          ② **被动**：被上游判 401/Unauthorized 时清缓存（`invalidate_token()` / `report_failure(…, "auth")`），
+             下一次取用即自动重铸。
+        """
         account = self.get_state(email)
         if account is None:
             raise CredentialUnavailableError(f"账号不在当前配置中：{mask_email(email)}")
         with self._token_locks[email]:
             now = self._now()
-            if account.token and (now - account.minted_at) < self.settings.token_ttl:
+            if self._fresh(account, now):
                 return account.token
             self._pace_signin()
             try:
@@ -191,6 +258,7 @@ class AccountPool:
                     retry_after=60.0) from exc
             account.token = token
             account.minted_at = self._now()
+            account.expires_at = jwt_exp(token) or 0.0
             account.mints += 1
             return token
 
@@ -199,6 +267,7 @@ class AccountPool:
         if account is not None:
             account.token = ""
             account.minted_at = 0.0
+            account.expires_at = 0.0
 
     # ------------------------------------------------------------------ 取号
 
@@ -294,6 +363,7 @@ class AccountPool:
             if kind == "auth":
                 account.token = ""
                 account.minted_at = 0.0
+                account.expires_at = 0.0
         self._notify()
 
     # ------------------------------------------------------------------ 观测
@@ -310,8 +380,9 @@ class AccountPool:
                     "account": mask_email(a.email),
                     "day_used": a.day_used,
                     "cap": self.settings.daily_video_cap,
-                    "token_cached": bool(a.token) and (now - a.minted_at) < self.settings.token_ttl,
+                    "token_cached": self._fresh(a, now),
                     "token_age_s": int(now - a.minted_at) if a.token else None,
+                    "token_expires_in_s": int(a.expires_at - now) if a.expires_at else None,
                     "mints": a.mints,
                     "inflight": a.inflight,
                     "cooldown_for_s": max(0, int(a.cooldown_until - now)),
