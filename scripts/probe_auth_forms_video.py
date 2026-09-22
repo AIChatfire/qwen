@@ -26,9 +26,9 @@
 
 ## 用法
     # 只跑免费段（零消耗）：看四种形态谁能建立 t2v 会话
-    python scripts/probe_auth_forms_video.py --email 2xx***@mail.xiuvi.cn
+    python scripts/probe_auth_forms_video.py --email user@example.com
     # 全矩阵（cookie 格真发 1 发，消耗该号 1 次视频额度）
-    python scripts/probe_auth_forms_video.py --email 2xx***@mail.xiuvi.cn \
+    python scripts/probe_auth_forms_video.py --email user@example.com \
         --pool /tmp/guest_ident_fresh.json --confirm --cooldown 90
 """
 from __future__ import annotations

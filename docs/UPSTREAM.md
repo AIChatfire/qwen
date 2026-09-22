@@ -110,14 +110,14 @@ Cookie: token=<JWT>
 | 路径 | 出口 | 跳不跳 |
 |---|---|---|
 | **使用侧**：`chats/new` / `chat/completions` / `task/status` / 产物下载 | **服务宿主机直连**（`QwenClient` 不配 proxy，`trust_env` 默认 `False`） | **零跳转**：同一次任务全程同一 IP；**所有账号共用这一个 IP**（无"每号一 IP"能力） |
-| **铸造侧**：signin 铸 token | `QWEN_SIGNIN_PROXY`（**HTTP(S) 代理**，当前 `.env` = `pool.livetest.cn:2086`） | **会跳**，且刻意如此（直连登录会把出口打进 WAF 墙，`qwen-chat-api.md` §2.6） |
+| **铸造侧**：signin 铸 token | `QWEN_SIGNIN_PROXY`（**HTTP(S) 代理**；**真实地址只在 gitignored 的 `.env`**，库内一律占位符） | **会跳**，且刻意如此（直连登录会把出口打进 WAF 墙，`qwen-chat-api.md` §2.6） |
 | 兜底：`QWEN_TOKEN_URL` | 外部 token 服务 | 由该服务决定（`accounts.py` 亦显式 `trust_env=False`） |
 
 🔴 **铸造侧只支持 HTTP(S) 代理形态（2026-09-22 用户决策：不做兼容，SOCKS 分支已删除）**。理由是对池的实测：
 
 | 语义 | 实测（池 2086） | 为什么正好合适 |
 |---|---|---|
-| **每连接换出口 IP** | 三次新连接 = `38.6.213.96 / .97 / .98` | 每次铸造换一个 IP ⇒ 不撞登录 IP 墙 |
+| **每连接换出口 IP** | 三次新连接 = **三个互不相同的出口 IP** | 每次铸造换一个 IP ⇒ 不撞登录 IP 墙 |
 | **同连接复用同 IP** | 同一 client 两次请求 = 同一 IP | 一次铸造的「预热 + 登录」**全程一个 IP**（自洽） |
 
 ⇒ 删掉自研 SOCKS5 拨号器后少约 130 行 socket/TLS/HTTP 解析，且**顺带修掉一个语义瑕疵**：
@@ -156,7 +156,7 @@ Cookie: token=<JWT>
 ⇒ 任何"某凭据形态能用"的结论，必须打在写端点上；只测 `chats/new` 会得出三种形态都行的错判。
 
 **`cookie` 格的三道自证（全绿）**：
-1. **归属**：产物 URL 的 `/output/<uuid>/` 段 = `3bc78ba9…` = JWT 载荷里的账号 id（一致）；
+1. **归属**：产物 URL 的 `/output/<uuid>/` 段 == JWT 载荷里的账号 id（**一致**；账号 id 本身不入库/不写文档）；
 2. **产物**：下载 **5,487,103 bytes**，容器 `mvhd` 时长 **5.042s**（与既有 n≥5 实测一致）；
 3. **凭据形态**：仅 `Cookie: token=<JWT>`（无其它 cookie）+ `chat_mode=normal`，全链路零 RGV587。
 
@@ -312,8 +312,8 @@ Cookie: token=<JWT>
 | `cgt-20260922012530-tyoa9` | t2v（16:9） | `2xx***@…` | ≈343s | 5.50 MB | **5.042s** |
 | `cgt-20260922013158-ae0tq` | i2v（16:9，上游样例图作首帧） | `yek***@…` | ≈93s | 9.59 MB | **5.042s** |
 
-- 两条链路的 upstream task id 分别为 `993a8bf4…` / `75a74158…`（存在本层任务记录，不进对外响应）。
-- **账号轮换实证**：两条产物 URL 里的 `resource_user_id` 不同（`3bc78ba9…` vs `e4fe05b6…`）
+- 两条链路的 upstream task id 已归档在**本层任务记录**里（不进对外响应，也不写进文档）。
+- **账号轮换实证**：两条产物 URL 里的 `resource_user_id` **互不相同**
   ⇒ 两次生成落在两个不同账号，各消耗 1/3 日额度。
 - 全链路零 RGV587、零告警；signin → `chats/new` → `completions` → `task/status` 全部 200。
 
