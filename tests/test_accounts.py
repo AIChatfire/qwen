@@ -9,6 +9,7 @@ import pytest
 from app.errors import CredentialUnavailableError, RateLimitedError
 from app.upstream.qwen.accounts import (
     OPAQUE_TOKEN_TTL,
+    TOKEN_TTL_DEFAULT,
     AccountPool,
     jwt_exp,
     mask_email,
@@ -237,13 +238,38 @@ def test_self_declared_exp_is_capped_by_ttl():
     assert needs_refresh(minted_at=minted, expires_at=exp, ttl=86400.0, now=minted + 86400)
 
 
-def test_exp_drives_refresh_when_cap_disabled():
-    """`ttl=0` ⇒ 不设上限，完全按 `exp`（提前量 = 生命的 10%，**上限 6 小时**）。"""
+def test_default_cap_six_days_reserves_headroom_for_suspected_seven():
+    """🔴 用户口径（2026-09-22）：`exp` 自称 30 天但**实际可能 7 天失效** ⇒
+    按 **6 天**换（`TOKEN_TTL_DEFAULT`），预留 1 天余量，不赌到最后一刻。"""
     minted = 1_000_000.0
     exp = minted + 30 * 86400
-    assert not needs_refresh(minted_at=minted, expires_at=exp, ttl=0.0, now=minted + 20 * 86400)
-    assert not needs_refresh(minted_at=minted, expires_at=exp, ttl=0.0, now=exp - 6 * 3600 - 1)
-    assert needs_refresh(minted_at=minted, expires_at=exp, ttl=0.0, now=exp - 6 * 3600)
+    assert TOKEN_TTL_DEFAULT == 6 * 86400
+    assert not needs_refresh(minted_at=minted, expires_at=exp,
+                             ttl=TOKEN_TTL_DEFAULT, now=minted + TOKEN_TTL_DEFAULT - 1)
+    assert needs_refresh(minted_at=minted, expires_at=exp,
+                         ttl=TOKEN_TTL_DEFAULT, now=minted + TOKEN_TTL_DEFAULT)
+    assert minted + TOKEN_TTL_DEFAULT < minted + 7 * 86400, "换 token 必须早于疑似的 7 天墙"
+
+
+def test_ttl_le_zero_falls_back_to_default_cap():
+    """`ttl<=0` **不再表示"关掉上限"**（那正是 7 天失效会咬人的位置）—— 一律归一到 6 天。"""
+    minted = 1_000_000.0
+    exp = minted + 30 * 86400
+    assert not needs_refresh(minted_at=minted, expires_at=exp,
+                             ttl=0.0, now=minted + TOKEN_TTL_DEFAULT - 1)
+    assert needs_refresh(minted_at=minted, expires_at=exp,
+                         ttl=0.0, now=minted + TOKEN_TTL_DEFAULT)
+    assert not needs_refresh(minted_at=minted, expires_at=exp, ttl=-5.0, now=minted + 3600)
+
+
+def test_short_exp_wins_over_longer_cap():
+    """`exp` 比上限**更短**时按 `exp` 走（提前量 6 小时）—— 上限只负责压住"过长的自称"。"""
+    minted = 1_000_000.0
+    exp = minted + 3 * 86400                        # 自称 3 天 < 6 天上限
+    assert not needs_refresh(minted_at=minted, expires_at=exp, ttl=TOKEN_TTL_DEFAULT,
+                             now=exp - 6 * 3600 - 1)
+    assert needs_refresh(minted_at=minted, expires_at=exp, ttl=TOKEN_TTL_DEFAULT,
+                         now=exp - 6 * 3600)
 
 
 def test_opaque_token_falls_back_to_ttl_then_default():
@@ -255,20 +281,19 @@ def test_opaque_token_falls_back_to_ttl_then_default():
     assert needs_refresh(minted_at=minted, expires_at=0.0, ttl=0.0, now=minted + OPAQUE_TOKEN_TTL)
 
 
-def test_pool_reuses_exp_bearing_token_until_near_expiry(settings):
-    """池的真实行为：`ttl=0` 时按 `exp` 判定 —— 第 20 天仍复用，进到提前量（≤6h）才重铸。"""
-    settings.token_ttl = 0.0
+def test_pool_remints_at_default_cap_not_at_self_declared_exp(settings):
+    """池的真实行为：默认 6 天上限 ⇒ **第 6 天就换**（不等自称的 30 天）。"""
     settings.signin_min_interval = 0.0
     clock = Clock()
     mints: list[str] = []
     pool = AccountPool(settings, mint=lambda a: (mints.append(a.email),
                                                  _jwt(clock.t + 30 * 86400))[1], now=clock)
     pool.token_for("a@x.cn")
-    clock.t += 20 * 86400
+    clock.t += TOKEN_TTL_DEFAULT - 1
     pool.token_for("a@x.cn")
-    assert len(mints) == 1                      # 还剩 10 天 ≫ 提前量 ⇒ 复用
+    assert len(mints) == 1                          # 还没到 6 天 ⇒ 复用
     assert pool.stats()["accounts"][0]["token_cached"] is True
-    clock.t += 9 * 86400 + 86400 - 3600         # 走到 exp 前 1 小时（已进提前量）
+    clock.t += 2                                    # 越过 6 天
     pool.token_for("a@x.cn")
     assert len(mints) == 2
 

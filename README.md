@@ -7,6 +7,7 @@ chat.qwen.ai 视频生成（**t2v / i2v**）的**火山方舟 Seedance 契约出
 ```
 POST /api/v3/contents/generations/tasks        → 200 {"id": "cgt-…"}   创建（只回 id）
 GET  /api/v3/contents/generations/tasks/{id}   → 200 方舟任务对象        查询（六态）
+GET  /v1/models                                → 200 能力清单            模型发现（OpenAI 形态）
 GET  /healthz · /readyz · /stats                                      运维面（无凭据原文）
 ```
 
@@ -35,7 +36,7 @@ GET  /healthz · /readyz · /stats                                      运维�
 
 ```bash
 cp .env.example .env
-# 填：QWEN_ACCOUNTS（多账号）、QWEN_ACCOUNT_PASSWORD、QWEN_SIGNIN_SOCKS（轮换出口，必填）
+# 填：QWEN_ACCOUNTS（多账号）、QWEN_ACCOUNT_PASSWORD、QWEN_SIGNIN_PROXY（轮换 HTTP 代理出口，必填）
 docker compose up -d --build
 curl -s localhost:8400/readyz
 ```
@@ -44,7 +45,7 @@ curl -s localhost:8400/readyz
 
 ```bash
 export QWEN_ACCOUNTS='a@x.cn,b@x.cn' QWEN_ACCOUNT_PASSWORD='…'
-export QWEN_SIGNIN_SOCKS='socks5h://user:pass@pool.example:2088'   # signin 必须走轮换出口
+export QWEN_SIGNIN_PROXY='http://user:pass@pool.example:2086'   # signin 必须走轮换出口（HTTP 代理）
 /Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/gunicorn \
   -c gunicorn_conf.py "app.main:create_app()"
 ```

@@ -1,9 +1,14 @@
 """FastAPI 应用工厂 —— 路由 / 错误信封 / 鉴权 / 健康检查 一处收拢。
 
-对外路由（**范围冻结**：核心两个端点；列表与取消刻意不实现 ⇒ 路由不存在）：
+对外路由（**方舟契约范围冻结**：核心两个端点；方舟的列表与取消刻意不实现 ⇒ 路由不存在）：
     POST /api/v3/contents/generations/tasks       创建（只回 {"id": …}；容量不足默认排队）
     GET  /api/v3/contents/generations/tasks/{id}  查询（方舟任务对象形状；顺带推进任务）
+    GET  /v1/models                              模型清单（**OpenAI 形态**，能力探测用）
     GET  /healthz /readyz /stats                 运维面（不含任何凭据原文）
+
+⚠️ `GET /v1/models` **不属于方舟任务契约**：它是给 OpenAI 系客户端 / 网关做"能力探测"的清单，
+   与"范围冻结"（方舟的列表 / 取消不做、不返回假数据）不冲突 —— 那是**任务列表**，
+   这是**能力列表**。它不涉密 ⇒ 不校验 Key。
 
 调试面：`X-Avm-Dry-Run: 1` 请求头 ⇒ 跑完整翻译后返回"将要发出的请求"，**零上游调用、零落库**。
 """
@@ -22,7 +27,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import __version__
+from . import __version__, models
 from .config import Settings
 from .coordinator import Coordinator
 from .errors import AdapterError, AuthenticationError, InvalidParameterError
@@ -136,6 +141,16 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
         credential_id = credential_id_of(request)
         result = await asyncio.to_thread(service.get, task_id, credential_id)
         return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/models")
+    async def list_models() -> dict:
+        """本服务对外宣告的模型清单（**OpenAI 形态**）。
+
+        只列**真正支持**的；刻意缺席的能力见 `app/models.py::DELIBERATE_ABSENCES`。
+        **不校验 Key**：清单不涉密，而 OpenAI 系客户端 / 网关（new-api 等）常在填 Key 之前
+        先探一次能力；这里返回 401 会让"探测失败"被误读成"服务不可用"。
+        """
+        return {"object": "list", "data": models.catalog()}
 
     @app.get("/healthz")
     async def healthz():

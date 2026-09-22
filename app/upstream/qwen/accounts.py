@@ -79,6 +79,8 @@ def jwt_exp(token: str) -> float | None:
         return None
 
 
+#: `QWEN_TOKEN_TTL` 缺省/非法时的保守上限：**6 天**（给"实际可能 7 天失效"预留 1 天余量）。
+TOKEN_TTL_DEFAULT = 6 * 86400.0
 #: 没有 `exp` 的不透明 token 的兜底缓存时长（6 小时）——只在外部 token 服务形态下用到。
 OPAQUE_TOKEN_TTL = 6 * 3600.0
 
@@ -86,24 +88,23 @@ OPAQUE_TOKEN_TTL = 6 * 3600.0
 def needs_refresh(minted_at: float, expires_at: float, ttl: float, now: float) -> bool:
     """要不要重新铸造 token。
 
-    判定 = **以 JWT 的 `exp` 为准（留提前量）** ∧ **不超过 `ttl` 这个保守上限**：
+    判定 = **以 JWT 的 `exp` 为准（留提前量）** ∧ **上限恒生效**：
 
-      · `exp` 是**上游自称**的有效期 —— 实测 qwen 是 30 天，但**自称不等同于服务端真实行为**
-        （服务端可能提前失效，例如自称 30 天、实际 7 天就判 401）⇒ 所以**必须再加一个保守缓存上限**
-        （`QWEN_TOKEN_TTL`，默认 1 天），不能把自称当真；
-      · `ttl <= 0` ⇒ 不设上限，完全按 `exp`（只在对上游行为有把握时才这么配）；
-      · 没有 `exp`（不透明 token，如外部 token 服务）⇒ 用 `ttl`（再兜底 `OPAQUE_TOKEN_TTL`）。
+      · `exp` 是**上游自称**的有效期 —— 实测 qwen 是 30 天，但**自称 ≠ 服务端真实行为**：
+        用户经验是"可能 **7 天**就失效"⇒ 用 `QWEN_TOKEN_TTL`（默认 **6 天**）把它压住，
+        **预留 1 天余量**，别赌到最后一刻；
+      · `ttl <= 0` ⇒ 归一到 `TOKEN_TTL_DEFAULT`（6 天）—— **刻意不提供"彻底关掉上限"的开关**：
+        那正好是"7 天失效"会咬人的位置，留这种旋钮只会让人配错；
+      · 没有 `exp`（不透明 token，如外部 token 服务）⇒ 用 `ttl`，`ttl<=0` 时兜底 `OPAQUE_TOKEN_TTL`（6 小时）。
 
     ⚠️ **真正兜底的不是本函数，而是被动路径**：上游一旦判 401 ⇒ 清缓存 → **立即重铸 → 原请求重试一次**
-    （见 `app/service.py::_authed_call`）。所以本函数只需"别太频繁换"，'换得太晚'由上一条兜住。
+    （见 `app/service.py::_authed_call`）。所以本函数只管"别换太频繁"，"换得不够早"由上一条兜住。
     """
     if expires_at:
+        ttl_eff = ttl if ttl > 0 else TOKEN_TTL_DEFAULT
         life = max(expires_at - minted_at, 1.0)
         margin = min(max(life * REFRESH_MARGIN_RATIO, REFRESH_MARGIN_MIN), REFRESH_MARGIN_MAX)
-        deadline = expires_at - margin
-        if ttl > 0:
-            deadline = min(deadline, minted_at + ttl)
-        return now >= deadline
+        return now >= min(expires_at - margin, minted_at + ttl_eff)
     return (now - minted_at) >= (ttl if ttl > 0 else OPAQUE_TOKEN_TTL)
 
 
@@ -205,11 +206,11 @@ class AccountPool:
             if not token:
                 raise MintError(f"token_url 未返回 token（{url.split('?')[0]}）")
             return token
-        if not s.signin_socks:
+        if not s.signin_proxy:
             raise CredentialUnavailableError(
-                "未配置 QWEN_SIGNIN_SOCKS / QWEN_TOKEN_URL —— 无法铸造 token"
+                "未配置 QWEN_SIGNIN_PROXY / QWEN_TOKEN_URL —— 无法铸造 token"
                 "（直连 signin 会把出口打进 WAF 墙，刻意不提供该路径）")
-        return mint_token(s.signin_socks, account.email, account.password,
+        return mint_token(s.signin_proxy, account.email, account.password,
                           base=s.base_url, user_agent=s.user_agent)
 
     def _pace_signin(self) -> None:

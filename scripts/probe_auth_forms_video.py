@@ -272,7 +272,7 @@ def main() -> int:
     args = ap.parse_args()
 
     env = read_env(pathlib.Path(args.env), ("QWEN_ACCOUNTS", "QWEN_ACCOUNT_PASSWORD",
-                                            "QWEN_SIGNIN_SOCKS", "QWEN_CHAT_MODEL"))
+                                            "QWEN_SIGNIN_PROXY", "QWEN_CHAT_MODEL"))
     model = env.get("QWEN_CHAT_MODEL") or "qwen3.7-plus"
     password = password_for(env, args.email)
     if not password:
@@ -288,12 +288,12 @@ def main() -> int:
 
     # 账号 token 只铸一次（两个账号格共用）；登录走轮换出口
     if any(f in ACCOUNT_FORMS for f in forms):
-        socks = env.get("QWEN_SIGNIN_SOCKS", "")
-        if not socks:
-            print("❌ .env 缺 QWEN_SIGNIN_SOCKS —— 铸造 token 必须走轮换出口")
+        egress = env.get("QWEN_SIGNIN_PROXY", "")
+        if not egress:
+            print("❌ .env 缺 QWEN_SIGNIN_PROXY —— 铸造 token 必须走轮换出口")
             return 2
         print("── 铸 token（经轮换出口，免费）…")
-        token = mint_token(socks, args.email, password, base=BASE, user_agent=UA)
+        token = mint_token(egress, args.email, password, base=BASE, user_agent=UA)
         print(f"   ✅ token_len={len(token)} | 账号 id={account_id(token)[:8]}…")
 
     last_account_write = 0.0

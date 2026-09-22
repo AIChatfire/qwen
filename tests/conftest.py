@@ -110,7 +110,7 @@ def settings(tmp_path) -> Settings:
         data_dir=str(tmp_path),
         api_keys=["sk-a", "sk-b"],
         key_secret="secret-for-tests",
-        signin_socks="socks5h://127.0.0.1:9",  # 不会被真的使用（mint 已注入）
+        signin_proxy="http://127.0.0.1:9",  # 不会被真的使用（mint 已注入）
         signin_min_interval=0.0,
         signin_wait_timeout=1.0,
         submit_min_interval=0.0,

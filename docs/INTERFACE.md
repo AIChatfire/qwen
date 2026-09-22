@@ -14,10 +14,15 @@
 | 2 | `GET` | `/api/v3/contents/generations/tasks/{id}` | 🔴 核心（逐字实现） |
 | 3 | `GET` | `/api/v3/contents/generations/tasks`（列表） | ⚪ **刻意不实现**（路由不存在 ⇒ 404/405） |
 | 4 | `DELETE` | `/api/v3/contents/generations/tasks/{id}` | ⚪ **刻意不实现**（同上；未终态也绝不伪造 `cancelled`） |
+| 5 | `GET` | `/v1/models` | 🟢 **OpenAI 形态能力清单**（见 §7；**不校验 Key**） |
 | — | `GET` | `/healthz` `/readyz` `/stats` | 运维面（不含任何凭据原文） |
 
 > 🔴 **范围冻结**：不适配的可选端点**不得返回空列表之类的假数据** —— 调用方会把"空列表"
 > 误读成"没有任务"。列表与取消要真做时，**先改本文件**再动代码。
+>
+> ⚠️ 上面第 5 条**不属于方舟任务契约**，与范围冻结不冲突：冻结的是**任务列表**（方舟的任务枚举），
+> `/v1/models` 给的是**能力列表**（OpenAI 系的模型发现），两者语义、形状、受众都不同。
+> 它只列真正支持的能力，刻意缺席的（参考图/尾帧/延长/音画/图片链路）见 `app/models.py::DELIBERATE_ABSENCES`。
 
 ---
 
@@ -134,7 +139,7 @@ Authorization: Bearer <key>
 | 退避 | 指数退避（`QUEUE_RETRY_BASE × 2^n`，上限 600s），并受 `SUBMIT_MAX_ATTEMPTS`（默认 5）与 `TASK_TIMEOUT` 双闸门封顶；`failed` 的 `error.message` 会显式声明"未提交、未消耗额度" |
 | 重启不丢 | `queued` / `running` 记录都在任务库（≥`TASK_RETENTION_DAYS`=7 天）；**账号额度计数与冷却也在 KV 里** ⇒ 新进程起来接着推进，不会把已用额度算成 0 |
 | 重启重新铸造 | 上游 token **刻意不落盘**（重启重新 signin，免费；避免凭据进持久层） |
-| **token 过期续期** | **主动**：按 JWT 自带的 `exp`（实名 30 天）**并压一个保守上限**（`QWEN_TOKEN_TTL`，默认 1 天）提前重铸；**被动**：上游判 401 ⇒ 清缓存 → **立即重铸 → 原请求重试一次**（写端点也重试：401 = 未受理，不会重复计费）。两次仍 401 ⇒ 判定凭据/账号问题（503 语义 + 账号冷却） |
+| **token 过期续期** | **主动**：按 JWT 自带的 `exp`（自称 30 天）**并压一个保守上限**（`QWEN_TOKEN_TTL`，默认 **6 天** = 给"实际可能 7 天失效"预留 1 天）提前重铸；**被动**：上游判 401 ⇒ 清缓存 → **立即重铸 → 原请求重试一次**（写端点也重试：401 = 未受理，不会重复计费）。两次仍 401 ⇒ 判定凭据/账号问题（503 语义 + 账号冷却） |
 | 请求去重 | ⚠️ **不提供**：同一 `POST` 重发两次 = 两条独立任务（方舟原生同样不保证幂等）。需要去重请在调用方做 |
 
 > 关闭队列回到严格模式：`SUBMIT_QUEUE_ENABLED=0`（容量不足 ⇒ 立即 429，与既有调用方行为一致）。
@@ -159,7 +164,7 @@ Authorization: Bearer <key>
 | 429 | `ServerOverloaded` | 上游 x5sec 风控（RGV587）；队列开启时通常不再直通（会排队换号重试，除非超次数） | **退避，勿连打**（重试会加深标记） |
 | 429 | `QuotaExceeded` | 账号额度耗尽（3 次/天/账号，UTC 日重置）；队列开启时通常转成排队 | 等跨日或换渠道 |
 | 502 | `InternalServiceError` | 上游 5xx / 非 JSON / WAF 页（**不自动重试**，防重复计费） | 退避重试 |
-| 503 | `CredentialUnavailable` | 本服务**凭据铸造/续期失败**（部署问题，非调用方错） | 联系运维（检查 `QWEN_SIGNIN_SOCKS` / `QWEN_TOKEN_URL`） |
+| 503 | `CredentialUnavailable` | 本服务**凭据铸造/续期失败**（部署问题，非调用方错） | 联系运维（检查 `QWEN_SIGNIN_PROXY` / `QWEN_TOKEN_URL`） |
 | 504 | `InternalServiceError` | 上游超时 | 退避重试 |
 
 - 失败响应带 `Retry-After` 头（当本层能给出建议等待时）；所有响应带 `x-request-id` 头
@@ -191,6 +196,32 @@ X-Avm-Dry-Run: 1
 
 ---
 
+## 7. `GET /v1/models`（OpenAI 形态能力清单）
+
+```
+GET /v1/models          # 无需 Authorization（能力探测要在填 Key 之前就能用）
+```
+
+```json
+{"object": "list",
+ "data": [{"id": "qwen/video", "object": "model", "created": 0, "owned_by": "qwen",
+           "title": "Qwen 视频生成（文生视频 / 单首帧图生视频）", "media": "video",
+           "accepts_image": true, "requires_image": false, "requires_prompt": true,
+           "max_input_images": 1, "duration_s": 5,
+           "ratios": ["1:1", "3:4", "4:3", "16:9", "9:16"],
+           "verified": true, "notes": "…"}]}
+```
+
+- **OpenAI 原生四键**（`id` / `object` / `created` / `owned_by`）恒在；其余为**加性扩展**
+  （对 unknown field 报错的严格客户端只取前四键即可）。
+- `created` **恒为 0** —— OpenAI 语义是"模型创建时间"，本服务无从得知，**不编时间戳**。
+- 🔴 **只列真正支持的**：刻意缺席的（`qwen/video-ref` / `-last-frame` / `-extend` / `-audio`、
+  以及图片链路的 `qwen/image`）见 `app/models.py::DELIBERATE_ABSENCES`，**不出现在清单里**。
+- 用途：OpenAI 系客户端 / 网关（new-api 等）做**能力探测**。它**不是**方舟任务契约的一部分
+  （见 §0 的两条说明）。
+
+---
+
 ## 6. 部署与环境变量（关键项）
 
 | env | 默认 | 说明 |
@@ -200,9 +231,9 @@ X-Avm-Dry-Run: 1
 | `QWEN_ACCOUNTS` / `QWEN_ACCOUNT_PASSWORD` / `QWEN_ACCOUNTS_FILE` | — | 账号池（多账号轮换；额度 3 次/天/账号） |
 | `QWEN_ACCOUNT_COOKIES[_FILE]` | 空 | 可选：每账号附加 cookie（整份 jar 或指纹 cookie）；默认只发 `token` 最小凭据 |
 | `QWEN_TRUST_ENV` | `0` | 🔴 **别开**：置 1 会让使用侧读取宿主环境代理变量 ⇒ 出口变成"经代理、可能一请求一 IP"（静默行为改变）。详见 `UPSTREAM.md` §2.5 |
-| `QWEN_SIGNIN_SOCKS` | 空 | **轮换 SOCKS5 出口**（signin 必须走它，直连会把出口打进 WAF 墙） |
+| `QWEN_SIGNIN_PROXY` | 空 | **轮换 HTTP(S) 代理出口**（signin 必须走它，直连会把出口打进 WAF 墙）。实测池语义：每连接换 IP + 同连接复用同 IP ⇒ 每次铸造换 IP、一次铸造全程一个 IP。**只收 `http(s)://`**（SOCKS 分支已删） |
 | `QWEN_TOKEN_URL` | 空 | 或改用外部 token 服务（`GET /token?account=`，同 image-adapter） |
-| `QWEN_TOKEN_TTL` | `86400` | token 缓存**上限**（秒）：主动续期取 `min(JWT exp − 提前量, 铸后本值)`。`0` = 不设上限（完全按 `exp`）。⚠️ 不能只看 `exp`——它是上游**自称**（实测 30 天），服务端可能提前失效；真正兜底是 401 当场重铸重试 |
+| `QWEN_TOKEN_TTL` | `518400` | token 缓存**上限**（秒）：主动续期取 `min(JWT exp − 提前量, 铸后本值)`。**默认 6 天 = 给"实际可能 7 天失效"预留 1 天**；`<=0` 也归一到 6 天（不提供"关掉上限"的开关）。⚠️ `exp` 是上游**自称**（实测 30 天），真正兜底是 401 当场重铸重试 |
 | `QWEN_DAILY_VIDEO_CAP` | `3` | 每账号每日视频额度（**UTC 日**窗口） |
 | `QWEN_SUBMIT_MIN_INTERVAL` | `15` | 同账号提交最小间隔（防写请求突发） |
 | `QWEN_SIGNIN_MIN_INTERVAL` | `45` | 跨账号共享的 signin 节奏 |

@@ -102,13 +102,18 @@ class Settings:
     # —— 凭据池（7 账号等） ——
     accounts: dict[str, str] = field(default_factory=dict)
     account_cookies: dict[str, str] = field(default_factory=dict)
-    signin_socks: str = ""
+    #: signin（铸造 token）的**轮换出口**：`http(s)://` 代理（推荐形态，也是唯一形态 ——
+    #: SOCKS 分支已按用户决策删除）。实测池语义：**每连接换 IP + 同连接复用同 IP**
+    #: ⇒ 每次铸造换一个 IP、一次铸造全程一个 IP。
+    #: 🔴 直连登录会把出口打进 WAF 墙，必须配轮换出口（或改用 `token_url`）。
+    signin_proxy: str = ""
     token_url: str = ""
     #: token 缓存**上限**（秒）—— 主动续期取 `min(JWT 的 exp - 提前量, 铸后本值)`。
-    #: 🔴 为什么不能只看 `exp`：`exp` 是上游**自称**的（实测 30 天），服务端可能提前失效
-    #: （自称 30 天、实际 7 天就判 401 是有先例的形态）⇒ 用一个保守上限把它压住，默认 **1 天**。
-    #: `0` = 不设上限（完全按 `exp`，仅在对上游行为有把握时用）；token 无 `exp` 时本值即兜底缓存时长。
-    token_ttl: float = 86400.0
+    #: 🔴 6 天 = **给"实际可能 7 天失效"预留 1 天**：`exp` 是上游**自称**的（实测 30 天），
+    #: 服务端可能提前失效 ⇒ 用本值压住，别赌到最后一刻。
+    #: `<=0` 归一到 6 天（**刻意不提供"关掉上限"的开关**：那正是会咬人的位置）；
+    #: token 无 `exp` 时（不透明 token）本值即兜底缓存时长。
+    token_ttl: float = 518400.0
     signin_min_interval: float = 45.0
     signin_wait_timeout: float = 45.0
     submit_min_interval: float = 15.0
@@ -153,9 +158,9 @@ class Settings:
             trust_env=_bool(env, "QWEN_TRUST_ENV", False),
             accounts=parse_accounts(env),
             account_cookies=parse_account_cookies(env),
-            signin_socks=_env(env, "QWEN_SIGNIN_SOCKS"),
+            signin_proxy=_env(env, "QWEN_SIGNIN_PROXY"),
             token_url=_env(env, "QWEN_TOKEN_URL"),
-            token_ttl=_num(env, "QWEN_TOKEN_TTL", 86400.0),
+            token_ttl=_num(env, "QWEN_TOKEN_TTL", 518400.0),
             signin_min_interval=_num(env, "QWEN_SIGNIN_MIN_INTERVAL", 45.0),
             signin_wait_timeout=_num(env, "QWEN_SIGNIN_WAIT_TIMEOUT", 45.0),
             submit_min_interval=_num(env, "QWEN_SUBMIT_MIN_INTERVAL", 15.0),
