@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+#: 门禁自身 —— 唯一被允许"含模式字面量"的文件（见 `scan_credentials` 的说明）
+SELF = Path(__file__).resolve()
 
 #: 允许出现在公开仓里的主机名 —— 每条必须能说出理由（新域名要显式加进来，别改成宽正则）
 ALLOWED_HOSTS: dict[str, str] = {
@@ -50,6 +52,10 @@ CREDENTIAL_PATTERNS: dict[str, str] = {
     "token= 长值": r"token=[A-Za-z0-9_\-\.]{20,}",
     "私钥块": r"BEGIN [A-Z ]*PRIVATE KEY",
     "常见密钥前缀": r"(ghp_|gho_|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|xox[baprs]-)",
+    # 🔴 **口令哈希形态**：signin 发的是 `sha256hex(口令)` ⇒ 库里出现裸 64-hex，
+    #    杀伤力等同于口令本身（拿去就能直接登录）。前面是 `:` 的（`sha256:` / `hmac-sha256:`
+    #    前缀，如镜像 digest、我方指纹）不算 —— 用负向后顾把这两类排除掉。
+    "裸 64-hex（疑似口令哈希）": r"(?<![\w:])([0-9a-f]{64})(?![\w])",
 }
 
 _SKIP_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".mp4", ".ico", ".pyc")
@@ -99,10 +105,18 @@ def scan_ips() -> dict[str, list[str]]:
 
 
 def scan_credentials() -> dict[str, list[str]]:
+    """扫凭据样态。
+
+    ⚠️ **唯一的自我豁免**：门禁文件本身要写下这些模式字面量（`ghp_` 之类）⇒ 不自豁免就会
+    自指误报（实测：该文件一旦被 `git add` 进库、开始被 `git ls-files` 看见，门禁立刻红）。
+    豁免只覆盖**本文件的凭据样态**这一条；主机名与 IP 两条仍然扫它（那两条不含字面量）。
+    """
     found: dict[str, list[str]] = {}
     for label, pattern in CREDENTIAL_PATTERNS.items():
         rx = re.compile(pattern)
         for path in tracked_files():
+            if path.resolve() == SELF:
+                continue
             if rx.search(_read(path)):
                 found.setdefault(label, []).append(str(path.relative_to(REPO)))
     return found
@@ -133,6 +147,24 @@ def test_no_private_ips_in_tracked_files():
 def test_no_credential_shaped_strings():
     """凭据样态不得入库（哪怕"看起来是假的" —— 判据是形状，不是意图）。"""
     assert scan_credentials() == {}, f"发现凭据样态：{scan_credentials()}"
+
+
+def test_self_exemption_is_load_bearing_and_narrow():
+    """豁免必须"装得上、且只在本文件起作用"：
+
+    · 门禁文件本身要在**跟踪集合**里（否则豁免是空转 —— 未 `git add` 时它扫不到自己）；
+    · 本文件**确实含**模式字面量（证明豁免是承重的，不是可有可无的摆设）；
+    · 除它之外，**任何文件都不得命中**（豁免不得长胖）。
+    """
+    assert SELF in [p.resolve() for p in tracked_files()], "门禁文件本身必须已被跟踪"
+    assert re.compile(CREDENTIAL_PATTERNS["常见密钥前缀"]).search(_read(SELF)), \
+        "本文件应含模式字面量（否则豁免不再承重，应删掉它）"
+    offending = [
+        str(p.relative_to(REPO)) for p in tracked_files()
+        if p.resolve() != SELF
+        and any(re.compile(pt).search(_read(p)) for pt in CREDENTIAL_PATTERNS.values())
+    ]
+    assert offending == [], f"除门禁文件外不该有文件命中凭据样态：{offending}"
 
 
 def test_allowed_hosts_are_documented():

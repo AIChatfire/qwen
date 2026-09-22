@@ -65,7 +65,7 @@ curl -s localhost:8400/api/v3/contents/generations/tasks \
 ### 测试
 
 ```bash
-/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 133 项，零网络
+/Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python -m pytest   # 134 项，零网络
 /Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/ruff check .
 /Users/betterme/.workbuddy/binaries/python/envs/qwen/bin/python scripts/env_sync_check.py  # .env ⇄ 模板 一致性
 ```
