@@ -210,6 +210,14 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                     model=req.model_requested,
                     delta={"role": "assistant", "content": ""},
                     degradations=req.degradations))
+                if req.thinking_gear != "fast":
+                    # 🔴 思考心跳（用户方案「输出空格变相加速」）：上游 thinking 阶段
+                    # 不产出任何可见文本（U-18），客户端会干等 ~6-15s；在思考期先发一个
+                    # 空格增量，让"首字"即刻到达（连接活性 + 打字态解锁）。
+                    # 仅流式；非流式正文不加前导空格。fast 档本身无思考等待，不发。
+                    yield _sse_dump(openai_chat.chunk_object(
+                        completion_id=completion_id, created=created,
+                        model=req.model_requested, delta={"content": " "}))
                 pending: str | None = first
                 while pending is not None:
                     yield _sse_dump(openai_chat.chunk_object(

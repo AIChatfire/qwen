@@ -29,10 +29,11 @@ from .errors import AdapterError, InvalidParameterError
 CHAT_TASK = "t2t"
 
 #: 认得但上游 t2t 没有的 OpenAI 参数 —— 出现即进 `degradations`（不假装支持、不静默丢弃）。
+#: 🔴 `reasoning_effort` **不在其中**：它是思考档位入口（`_thinking_gear`），见 THINKING_GEARS。
 UNSUPPORTED_PARAMS = (
     "temperature", "top_p", "n", "max_tokens", "max_completion_tokens", "max_output_tokens",
     "presence_penalty", "frequency_penalty", "stop", "seed", "tools", "tool_choice",
-    "response_format", "logit_bias", "logprobs", "top_logprobs", "reasoning_effort",
+    "response_format", "logit_bias", "logprobs", "top_logprobs",
     "modalities", "audio", "stream_options", "service_tier", "user",
 )
 
@@ -65,6 +66,8 @@ class ChatRequest:
     #: 待上传附件（kind ∈ file/audio/video/image；source = http(s) URL 或 data: URI）。
     #: 由 service 层走上传链（getstsToken → OSS PUT）换成 files[] 条目。
     attachment: tuple[str, str] | None = None
+    #: 思考档位（auto/thinking/fast，对齐前端三档；缺省 auto = 前端默认）。
+    thinking_gear: str = "auto"
     degradations: list[str] = field(default_factory=list)
 
 
@@ -193,6 +196,26 @@ def _flatten(messages: list[tuple[str, str]]) -> tuple[str, list[str]]:
     return "\n\n".join(parts), degradations
 
 
+def _thinking_gear(body: dict) -> str:
+    """思考档位解析（对齐前端"自动/思考/快速"三档，UPSTREAM §4.6 档位表）。
+
+    · `reasoning_effort`："none"/"minimal" ⇒ fast（关思考，首字最快）；"high" ⇒ thinking
+      （强制思考）；其余/缺省 ⇒ auto（前端默认）。
+    · `enable_thinking`（DashScope 风格）：false ⇒ fast（显式声明优先于 reasoning_effort 缺省）。
+    """
+    if "enable_thinking" in body:
+        et = body.get("enable_thinking")
+        truthy = et is True or (isinstance(et, str) and et.strip().lower() in ("1", "true", "yes"))
+        if not truthy:
+            return "fast"
+    effort = str(body.get("reasoning_effort") or "").strip().lower()
+    if effort in ("none", "minimal"):
+        return "fast"
+    if effort == "high":
+        return "thinking"
+    return "auto"
+
+
 def parse_openai_chat_request(body: dict) -> ChatRequest:
     """OpenAI chat 请求 → `ChatRequest`。请求写错一律 400（`InvalidParameterError`）。"""
     if not isinstance(body, dict):
@@ -266,6 +289,7 @@ def parse_openai_chat_request(body: dict) -> ChatRequest:
 
     return ChatRequest(model_requested=model_requested, model=model, prompt=prompt,
                        stream=stream, files=files, attachment=attachment,
+                       thinking_gear=_thinking_gear(body),
                        degradations=degradations)
 
 

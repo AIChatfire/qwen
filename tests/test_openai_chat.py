@@ -349,11 +349,71 @@ def test_chat_stream_route(client_app):
     assert chunks[0]["object"] == "chat.completion.chunk"
     assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
     texts = [c["choices"][0]["delta"].get("content", "") for c in chunks[1:-1]]
-    assert "".join(texts) == "你好，世界"
+    # 🔴 thinking 心跳：思考档（默认 auto）在正文前先发一个空格增量（变相加速首字）
+    assert texts[0] == " "
+    assert "".join(texts[1:]) == "你好，世界"
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["usage"] == {"prompt_tokens": 2421, "completion_tokens": 12,
                                    "total_tokens": 2433}
     assert all(c["model"] == "qwen3.7-plus" for c in chunks)
+
+
+def test_thinking_gear_fast_skips_heartbeat_and_uses_fast_config(client_app):
+    """reasoning_effort=none ⇒ 快速档：无思考心跳 + 上游收到 thinking_enabled false。"""
+    test_client, fake, _, _ = client_app
+    with test_client.stream("POST", CHAT_PATH,
+                            json={**CHAT_BODY, "stream": True, "reasoning_effort": "none"},
+                            headers=AUTH_A) as resp:
+        raw = "".join(resp.iter_text())
+    events = [json.loads(line[len("data:"):]) for line in raw.splitlines()
+              if line.startswith("data:") and line != "data: [DONE]"]
+    texts = [e["choices"][0]["delta"].get("content", "") for e in events
+             if e.get("choices")]
+    assert " " not in texts[:1], "快速档不发心跳空格"
+    assert "".join(texts).strip() == "你好，世界"
+    fc = fake.bodies("/api/v2/chat/completions")[0]["messages"][0]["feature_config"]
+    assert fc["thinking_enabled"] is False and fc["thinking_mode"] == "Fast"
+
+
+def test_thinking_gear_mapping_and_high_forces_thinking():
+    """reasoning_effort/enable_thinking → 档位映射（none/minimal=fast、high=thinking、缺省=auto）。"""
+    def gear(body):
+        return openai_chat.parse_openai_chat_request(body).thinking_gear
+    assert gear({"model": "m", "messages": [{"role": "user", "content": "x"}]}) == "auto"
+    assert gear({"model": "m", "reasoning_effort": "none",
+                 "messages": [{"role": "user", "content": "x"}]}) == "fast"
+    assert gear({"model": "m", "reasoning_effort": "minimal",
+                 "messages": [{"role": "user", "content": "x"}]}) == "fast"
+    assert gear({"model": "m", "reasoning_effort": "high",
+                 "messages": [{"role": "user", "content": "x"}]}) == "thinking"
+    assert gear({"model": "m", "reasoning_effort": "medium",
+                 "messages": [{"role": "user", "content": "x"}]}) == "auto"
+    assert gear({"model": "m", "enable_thinking": False,
+                 "messages": [{"role": "user", "content": "x"}]}) == "fast"
+    assert gear({"model": "m", "enable_thinking": True,
+                 "messages": [{"role": "user", "content": "x"}]}) == "auto"
+    # enable_thinking=false 优先于 reasoning_effort 缺省；reasoning_effort=high 时 false 仍赢
+    assert gear({"model": "m", "enable_thinking": False, "reasoning_effort": "high",
+                 "messages": [{"role": "user", "content": "x"}]}) == "fast"
+
+
+def test_thinking_gear_passes_to_upstream_body(ark_app):
+    """reasoning_effort=high ⇒ 上游收到思考档（Thinking + auto_thinking false）。"""
+    tc, _, fake_ark, _ = ark_app
+    body = {"model": "qwen3.7-plus", "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "description": "d",
+                                                        "parameters": {}}}]}
+    resp = tc.post(CHAT_PATH, json=body, headers=AUTH_A)
+    assert resp.status_code == 200
+    # 走了回退，但提交体在回退前构造？—— 回退不经过 qwen 提交 ⇒ 用非回退路径验证：
+    # 直接构造无 tools 请求时才走 qwen；这里改用 dry-run 校验
+    body.pop("tools")
+    resp = tc.post(CHAT_PATH, json={**body, "X-Avm-Dry-Run": "1"} | {},
+                   headers={**AUTH_A, "X-Avm-Dry-Run": "1"})
+    assert resp.status_code == 200
+    fc = resp.json()["upstream"]["body"]["messages"][0]["feature_config"]
+    assert fc["thinking_mode"] == "Thinking" and fc["auto_thinking"] is False
 
 
 def test_chat_stream_first_chunk_carries_degradations(client_app):

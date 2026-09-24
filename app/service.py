@@ -259,7 +259,7 @@ class QwenVideoService:
                 "headers": headers,
                 "body": self.client.build_chat_submit_body(
                     "<chat_id>", model=req.model, prompt=req.prompt,
-                    files=req.files or None),
+                    files=req.files or None, gear=req.thinking_gear),
             },
             "degradations": req.degradations,
         }
@@ -297,7 +297,8 @@ class QwenVideoService:
                                                extra_cookies=extra)
                 body = self.client.build_chat_submit_body(chat_id, model=req.model,
                                                           prompt=req.prompt,
-                                                          files=files or None)
+                                                          files=files or None,
+                                                          gear=req.thinking_gear)
                 stream = self.client.stream_chat(token, chat_id, body, extra_cookies=extra,
                                                  meta=meta)
                 self.pool.report_chat_submitted(email)

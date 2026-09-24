@@ -48,17 +48,32 @@ FEATURE_CONFIG = {
     "auto_search": True,
 }
 
+#: t2t 思考档位 —— 2026-09-24 前端抓包逐字（"自动/思考/快速"三档，UI 选择器"自动 ▾"）：
+#:   自动 = thinking_mode "Auto" + auto_thinking true（前端默认）；
+#:   思考 = thinking_mode "Thinking" + auto_thinking false（强制思考）；
+#:   快速 = **thinking_enabled false**（关思考 —— 提速档，首字最快）。
+#: 共同：output_schema "phase"、research_mode "normal"、auto_search true。
+THINKING_GEARS: dict[str, dict] = {
+    "auto": {
+        "thinking_enabled": True, "output_schema": "phase", "research_mode": "normal",
+        "auto_thinking": True, "thinking_mode": "Auto", "thinking_format": "summary",
+        "auto_search": True,
+    },
+    "thinking": {
+        "thinking_enabled": True, "output_schema": "phase", "research_mode": "normal",
+        "auto_thinking": False, "thinking_mode": "Thinking", "thinking_format": "summary",
+        "auto_search": True,
+    },
+    "fast": {
+        "thinking_enabled": False, "output_schema": "phase", "research_mode": "normal",
+        "auto_thinking": False, "thinking_mode": "Fast", "auto_search": True,
+    },
+}
+
 #: t2t 抓包（2026-09-24）的 feature_config —— **逐字**：thinking 开、thinking_mode=Thinking、
 #: thinking_format=summary（视频片段里没有这个键）。别拿它跟 FEATURE_CONFIG"合并"。
-CHAT_FEATURE_CONFIG = {
-    "thinking_enabled": True,
-    "output_schema": "phase",
-    "research_mode": "normal",
-    "auto_thinking": True,
-    "thinking_mode": "Thinking",
-    "thinking_format": "summary",
-    "auto_search": True,
-}
+#: 🔴 默认档位已对齐前端"自动"档（thinking_mode Auto）——`THINKING_GEARS["auto"]`。
+CHAT_FEATURE_CONFIG = dict(THINKING_GEARS["auto"])
 
 
 def tz_header() -> str:
@@ -292,13 +307,15 @@ class QwenClient:
 
     def build_chat_submit_body(self, chat_id: str, *, model: str, prompt: str,
                                files: list[dict] | None = None,
-                               ts: int | None = None) -> dict:
+                               ts: int | None = None,
+                               gear: str = "auto") -> dict:
         """t2t 提交体 —— 逐字对齐 2026-09-24 用户抓包（纯函数；dry_run 也走这里）。
 
         与视频体（`build_submit_body`）的实证差异：
           · `stream: True`（视频用 stream:false 拿同步 task_id；t2t 抓包即流式）；
           · **没有 `size`**（顶层与 extra.meta 都没有 —— 文本任务无画幅）；
-          · `feature_config` thinking 开（`CHAT_FEATURE_CONFIG`，多 `thinking_format` 键）。
+          · `feature_config` 按**思考档位**取（`THINKING_GEARS`：auto/thinking/fast，
+            前端三档抓包逐字；缺省 auto = 前端默认）。
         与视频体**相同**的（2026-09-24 真实一发已证）：
           · 顶层 `chatId` 与小写 `chat_id` **双写**（缺小写 ⇒ 上游 400
             `RequestValidationError: Field 'chat_id': Field required`）；
@@ -319,7 +336,7 @@ class QwenClient:
             "models": [model],
             "model": "",
             "chat_type": "t2t",
-            "feature_config": dict(CHAT_FEATURE_CONFIG),
+            "feature_config": dict(THINKING_GEARS.get(gear) or CHAT_FEATURE_CONFIG),
             "extra": {"meta": {"subChatType": "t2t"}},
             "sub_chat_type": "t2t",
             "parent_id": None,
@@ -506,6 +523,7 @@ class QwenClient:
 
 __all__ = [
     "CHAT_FEATURE_CONFIG",
+    "THINKING_GEARS",
     "FEATURE_CONFIG",
     "QwenClient",
     "extract_stream_text",

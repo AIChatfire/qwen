@@ -292,6 +292,19 @@ Authorization: Bearer <key>        # 必须带（写端点）
 - 每个请求**新建上游会话**（`chats/new` 免费段）：无状态、不缓存会话、账号轮换不受影响
   （U-13 ✅：`chats/new` 传 `chat_type="t2t"` + 指定模型，实测可用）。
 
+### 8.2.1 思考档位（`reasoning_effort` / `enable_thinking`，2026-09-24 前端抓包三档）
+
+| 档位 | 触发 | 上游 `feature_config`（抓包逐字） | 首字体感 |
+|---|---|---|---|
+| **fast（快速）** | `reasoning_effort:"none"/"minimal"` 或 `enable_thinking:false` | `thinking_enabled:false, thinking_mode:"Fast"` | 最快（无思考等待） |
+| **auto（自动，缺省）** | 不传 / `reasoning_effort:"medium"/"low"/"auto"` | `thinking_mode:"Auto", auto_thinking:true` | 模型自主决定是否思考 |
+| **thinking（思考）** | `reasoning_effort:"high"` | `thinking_mode:"Thinking", auto_thinking:false` | 强制思考（慢） |
+
+- 上游思考**不流式**（U-18）：`thinking_summary` 阶段 content 恒空，思考文本不下发 ⇒ 本门**不产出**
+  `delta.reasoning_content`（不编造）。
+- 🔴 **思考心跳**：思考期上游静默，流式应答在正文前先发一个**空格增量**变相解锁"首字"
+  （用户方案）——流式正文会带一个前导空格（非流式不带；fast 档无心跳）。拼正文请 `strip` 或跳过首空格。
+
 ### 8.3 响应
 
 非流式（`stream:false`）：

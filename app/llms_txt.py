@@ -84,6 +84,8 @@ def render_llms_txt(settings: Settings, chat_models: list[str] | None = None) ->
     lines.append("")
     lines.append(f"已注册 {len(chat_models)} 个上游 chat 模型（TTL 缓存，来自上游 "
                  f"`GET /api/models`，仅注册真正可跑 t2t 的条目）。")
+    lines.append("思考档位：`reasoning_effort`（`none`/`minimal`=快速、`high`=强制思考、缺省=自动）或 "
+                 "`enable_thinking:false`；流式思考期发空格心跳变相加速首字（正文前导一个空格）。")
     lines.append("")
     lines.append("### 附件解析（chat 门）")
     lines.append("")
