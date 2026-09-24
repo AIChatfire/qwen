@@ -200,12 +200,12 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
         completion_id = openai_chat.new_completion_id()
         created = int(time.time())
         gen = service.chat_stream(req, meta=meta)
-        first_task = asyncio.create_task(asyncio.to_thread(next, gen, None))
-        try:
-            first = await asyncio.wait_for(first_task, timeout=3.0)
-            pending_first = False
-        except TimeoutError:
-            first, pending_first = None, True   # 上游仍在处理 —— 心跳先行，结果流内回收
+        first_task = asyncio.ensure_future(asyncio.to_thread(next, gen, None))
+        done_set, _ = await asyncio.wait({first_task}, timeout=3.0)
+        # 🔴 用 asyncio.wait（不取消任务）而非 wait_for（超时会 cancel —— 线程结果将
+        # 无法回收，流内 await 时抛 CancelledError ⇒ 流静默断掉，2026-09-24 实测踩坑）
+        pending_first = not done_set
+        first = first_task.result() if done_set else None
 
         async def sse():
             try:
