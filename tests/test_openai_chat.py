@@ -436,7 +436,11 @@ def test_stream_slow_upstream_precheck_timeout_path(settings, fake_upstream):
         with tc.stream("POST", CHAT_PATH, json={**CHAT_BODY, "stream": True},
                        headers=AUTH_A) as resp:
             raw = "".join(resp.iter_text())
-    assert "你好，世界" in raw.replace(" ", ""), "慢上游流必须完整送达"
+    events = [json.loads(ln[len("data:"):]) for ln in raw.splitlines()
+              if ln.startswith("data:") and "[DONE]" not in ln]
+    content = "".join(e["choices"][0]["delta"].get("content") or ""
+                      for e in events if e.get("choices"))
+    assert "你好，世界" in content, "慢上游流必须完整送达"
     assert ": ping" in raw
     assert raw.rstrip().endswith("data: [DONE]")
 
