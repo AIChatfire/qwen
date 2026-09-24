@@ -192,16 +192,20 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                                        meta: dict) -> StreamingResponse:
         """OpenAI SSE 翻译：上游增量文本 → `chat.completion.chunk` 事件流。
 
-        🔴 首个增量在**返回响应头之前**拉取：上游拒绝/风控/零输出等失败此时仍能回
-        正经 HTTP 错误；进入流后的失败只能按 OpenAI 流内 error 事件收尾（不能再改状态码）。
-        `usage`（上游真值，经 meta 回传）随末片出现（加性，OpenAI 惯例的 include_usage 语义）。
+        🔴 预检窗口 3s：先等上游首增量 3s——来了 ⇒ 失败（拒绝/风控/零输出）仍回正经
+        HTTP 错误；没来 ⇒ 先发头 + role/心跳 chunk（思考期不干等），首个增量改在流内
+        等待（届时失败只能按流内 error 事件收尾——上游客已接受，此路径罕见）。
+        `usage`（上游真值，经 meta 回传）随末片出现（加性，OpenAI 惯例 include_usage）。
         """
         completion_id = openai_chat.new_completion_id()
         created = int(time.time())
         gen = service.chat_stream(req, meta=meta)
-        first = await asyncio.to_thread(next, gen, None)
-        if first is None:
-            raise UpstreamError("chat 流未产生任何增量（上游零输出按失败，不报成功）")
+        first_task = asyncio.create_task(asyncio.to_thread(next, gen, None))
+        try:
+            first = await asyncio.wait_for(first_task, timeout=3.0)
+            pending_first = False
+        except TimeoutError:
+            first, pending_first = None, True   # 上游仍在处理 —— 心跳先行，结果流内回收
 
         async def sse():
             try:
@@ -212,13 +216,17 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                     degradations=req.degradations))
                 if req.thinking_gear != "fast":
                     # 🔴 思考心跳（用户方案「输出空格变相加速」）：上游 thinking 阶段
-                    # 不产出任何可见文本（U-18），客户端会干等 ~6-15s；在思考期先发一个
-                    # 空格增量，让"首字"即刻到达（连接活性 + 打字态解锁）。
+                    # 不产出任何可见文本（U-18），客户端会干等 ~6-15s+；先发一个空格
+                    # 增量让"首字"即刻到达（连接活性 + 打字态解锁）。
                     # 仅流式；非流式正文不加前导空格。fast 档本身无思考等待，不发。
                     yield _sse_dump(openai_chat.chunk_object(
                         completion_id=completion_id, created=created,
                         model=req.model_requested, delta={"content": " "}))
                 pending: str | None = first
+                if pending_first:
+                    pending = await first_task   # 预检未到的首增量在流内回收
+                if pending is None:
+                    raise UpstreamError("chat 流未产生任何增量（上游零输出按失败，不报成功）")
                 while pending is not None:
                     yield _sse_dump(openai_chat.chunk_object(
                         completion_id=completion_id, created=created,
