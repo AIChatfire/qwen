@@ -414,6 +414,33 @@ def test_reasoning_content_passthrough(client_app):
     assert "答案" in content
 
 
+def test_stream_slow_upstream_precheck_timeout_path(settings, fake_upstream):
+    """🔴 预检窗口（3s）超时路径：上游慢（>3s）⇒ 流仍完整（心跳+ping+正文+DONE）。
+
+    此用例钉住「解包 None」回归：预检超时分支曾先解包 first=None ⇒ TypeError ⇒
+    流静默断（无 error 无 DONE），只有回环实测才暴露。
+    """
+    import dataclasses
+
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    s = dataclasses.replace(settings, ping_interval=0.5)
+    fake_upstream.chat_sse_delay = 1.0   # 每行 1s ⇒ 首增量 >3s 预检窗口
+    store = TaskStore(s.task_db)
+    pool = AccountPool(s, mint=lambda account: f"tok-{account.email}")
+    client = QwenClient(s, transport=fake_upstream.transport())
+    app = create_app(s, store=store, pool=pool, client=client)
+    with TestClient(app) as tc:
+        with tc.stream("POST", CHAT_PATH, json={**CHAT_BODY, "stream": True},
+                       headers=AUTH_A) as resp:
+            raw = "".join(resp.iter_text())
+    assert "你好，世界" in raw.replace(" ", ""), "慢上游流必须完整送达"
+    assert ": ping" in raw
+    assert raw.rstrip().endswith("data: [DONE]")
+
+
 def test_thinking_gear_fast_skips_heartbeat_and_uses_fast_config(client_app):
     """reasoning_effort=none ⇒ 快速档：无思考心跳 + 上游收到 thinking_enabled false。"""
     test_client, fake, _, _ = client_app

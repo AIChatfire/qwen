@@ -223,15 +223,18 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                         completion_id=completion_id, created=created,
                         model=req.model_requested, delta={"content": " "}))
                 ping_interval = getattr(settings, "ping_interval", 15.0)
-                kind, pending = first
                 if pending_first:
-                    # 预检未到首增量：等待期也发 ping（心跳空格已先行）
+                    # 🔴 预检超时（first=None）：必须**先回收结果再解包**——解包 None 会
+                    # TypeError（非 AdapterError → 流静默断，2026-09-24 实测踩坑）。
+                    # 等待期也发 ping（心跳空格已先行）。
                     while True:
                         done_set, _ = await asyncio.wait({first_task}, timeout=ping_interval)
                         if done_set:
                             break
                         yield ": ping\n\n"
                     kind, pending = first_task.result()
+                else:
+                    kind, pending = first
                 if pending is None:
                     raise UpstreamError("chat 流未产生任何增量（上游零输出按失败，不报成功）")
                 while kind is not None:
