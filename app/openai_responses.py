@@ -155,6 +155,16 @@ def delta_event(item_id: str, delta: str) -> dict:
             "output_index": 0, "content_index": 0, "delta": delta}
 
 
+def reasoning_delta_event(item_id: str, delta: str) -> dict:
+    """思考摘要增量（Responses 形态）：`response.reasoning_summary_text.delta`。
+
+    数据源 = 上游 `thinking_summary.extra` 的分步标题/要点（真实数据透传，
+    2026-09-24 实测；Qwen 门经 chat 流翻译，与 openai_chat 的 reasoning_content 同源）。
+    """
+    return {"type": "response.reasoning_summary_text.delta", "item_id": item_id,
+            "output_index": 0, "summary_index": 0, "delta": delta}
+
+
 def completed_event(response: dict) -> dict:
     return {"type": "response.completed", "response": response}
 

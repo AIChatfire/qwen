@@ -264,7 +264,8 @@ class QwenVideoService:
             "degradations": req.degradations,
         }
 
-    def chat_stream(self, req: ChatRequest, meta: dict | None = None) -> Iterator[str]:
+    def chat_stream(self, req: ChatRequest, meta: dict | None = None
+                    ) -> Iterator[tuple[str, str]]:
         """chat（t2t）→ 上游增量文本流。
 
         · 每次请求**新建上游会话**（无状态；OpenAI 客户端自带完整历史）；
@@ -274,6 +275,9 @@ class QwenVideoService:
           （chat 是同步链路，没有任务表可排队）；
         · **附件上传链**（2026-09-24）：file/audio/video/data: 图 附件在拿到账号 token 后
           「解析来源 → getstsToken → OSS V1 PUT → files[] 条目」再提交（UPSTREAM §4.7）；
+        · 产出 `(kind, text)`：answer = 正文（转 `delta.content`）；reasoning = 思考摘要
+          （上游 thinking_summary.extra 的分步增量，转 `delta.reasoning_content`，
+          官网 UI 同款数据，2026-09-24 实测）。
         · `meta`：可选的回传口袋 —— 上游流里的 `usage`（真实值，最后一份）写在
           `meta["usage"]`，由路由层透传（见 `openai_chat.openai_usage`）。
         """

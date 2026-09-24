@@ -300,8 +300,11 @@ Authorization: Bearer <key>        # 必须带（写端点）
 | **auto（自动，缺省）** | 不传 / `reasoning_effort:"medium"/"low"/"auto"` | `thinking_mode:"Auto", auto_thinking:true` | 模型自主决定是否思考 |
 | **thinking（思考）** | `reasoning_effort:"high"` | `thinking_mode:"Thinking", auto_thinking:false` | 强制思考（慢） |
 
-- 上游思考**不流式**（U-18）：`thinking_summary` 阶段 content 恒空，思考文本不下发 ⇒ 本门**不产出**
-  `delta.reasoning_content`（不编造）。
+- 🔴 **思考摘要透传**（2026-09-24 二次实测）：`thinking_summary` 事件的 `delta.extra` 里有
+  `summary_title` / `summary_thought`（**分步标题+要点**，数组逐步累加 —— 官网 UI 同款数据）。
+  本门对新增条目做 diff，转成 **`delta.reasoning_content`**（流式）/
+  `response.reasoning_summary_text.delta`（Responses 流式）增量下发。思考全文仍不下发（上游只给摘要）。
+- 非流式应答的 `message` 无 reasoning 字段（上游不给）——要思考摘要请用流式。
 - 🔴 **思考心跳**：思考期上游静默，流式应答在正文前先发一个**空格增量**变相解锁"首字"
   （用户方案）——流式正文会带一个前导空格（非流式不带；fast 档无心跳）。拼正文请 `strip` 或跳过首空格。
 

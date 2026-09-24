@@ -200,7 +200,7 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
         completion_id = openai_chat.new_completion_id()
         created = int(time.time())
         gen = service.chat_stream(req, meta=meta)
-        first_task = asyncio.ensure_future(asyncio.to_thread(next, gen, None))
+        first_task = asyncio.ensure_future(asyncio.to_thread(next, gen, (None, None)))
         done_set, _ = await asyncio.wait({first_task}, timeout=3.0)
         # 🔴 用 asyncio.wait（不取消任务）而非 wait_for（超时会 cancel —— 线程结果将
         # 无法回收，流内 await 时抛 CancelledError ⇒ 流静默断掉，2026-09-24 实测踩坑）
@@ -223,7 +223,7 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                         completion_id=completion_id, created=created,
                         model=req.model_requested, delta={"content": " "}))
                 ping_interval = getattr(settings, "ping_interval", 15.0)
-                pending: str | None = first
+                kind, pending = first
                 if pending_first:
                     # 预检未到首增量：等待期也发 ping（心跳空格已先行）
                     while True:
@@ -231,25 +231,32 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                         if done_set:
                             break
                         yield ": ping\n\n"
-                    pending = first_task.result()
+                    kind, pending = first_task.result()
                 if pending is None:
                     raise UpstreamError("chat 流未产生任何增量（上游零输出按失败，不报成功）")
-                while pending is not None:
-                    yield _sse_dump(openai_chat.chunk_object(
-                        completion_id=completion_id, created=created,
-                        model=req.model_requested, delta={"content": pending}))
+                while kind is not None:
+                    if kind == "reasoning":
+                        # 🔴 思考摘要透传（官网 UI 同款数据 → DeepSeek 风格 reasoning_content）
+                        yield _sse_dump(openai_chat.chunk_object(
+                            completion_id=completion_id, created=created,
+                            model=req.model_requested,
+                            delta={"reasoning_content": pending}))
+                    else:
+                        yield _sse_dump(openai_chat.chunk_object(
+                            completion_id=completion_id, created=created,
+                            model=req.model_requested, delta={"content": pending}))
                     # 🔴 周期 ping（用户 92 报障的根治）：上游 thinking/生成静默可达 50s+，
                     # 客户端↔nginx 之间全程无字节的静默流会被中间层 idle 掐断（curl 92
                     # HTTP/2 stream not closed cleanly）。每 ping_interval 发一条 SSE
                     # 注释（`: ping`）——注释行对 OpenAI 解析器不可见、不污染正文，
                     # 但让任何中间层都不再看到"静默流"。
-                    task = asyncio.ensure_future(asyncio.to_thread(next, gen, None))
+                    task = asyncio.ensure_future(asyncio.to_thread(next, gen, (None, None)))
                     while True:
                         done_set, _ = await asyncio.wait({task}, timeout=ping_interval)
                         if done_set:
                             break
                         yield ": ping\n\n"
-                    pending = task.result()
+                    kind, pending = task.result()
                 yield _sse_dump(openai_chat.chunk_object(
                     completion_id=completion_id, created=created,
                     model=req.model_requested, delta={}, finish_reason="stop",
@@ -369,7 +376,8 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
             created = int(time.time())
 
             def run() -> str:
-                return "".join(service.chat_stream(req, meta=meta))
+                return "".join(t for kind, t in service.chat_stream(req, meta=meta)
+                               if kind == "answer")
 
             text = await asyncio.to_thread(run)
             return JSONResponse(status_code=200, content=openai_chat.completion_object(
@@ -461,13 +469,13 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
 
             if req.stream:
                 gen = service.chat_stream(req, meta=meta)
-                first = await asyncio.to_thread(next, gen, None)
-                if first is None:
+                first = await asyncio.to_thread(next, gen, (None, None))
+                if first[1] is None:
                     raise UpstreamError("chat 流未产生任何增量（上游零输出按失败，不报成功）")
                 item_id = openai_responses.new_message_id()
 
                 async def sse():
-                    collected: list[str] = [first]
+                    collected: list[str] = []
                     try:
                         yield _sse_dump(openai_responses.created_event(
                             openai_responses.response_object(
@@ -477,12 +485,14 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                                 output=[{"type": "message", "id": item_id,
                                          "role": "assistant", "status": "in_progress",
                                          "content": []}])))
-                        yield _sse_dump(openai_responses.delta_event(item_id, first))
-                        pending: str | None = await asyncio.to_thread(next, gen, None)
-                        while pending is not None:
-                            collected.append(pending)
-                            yield _sse_dump(openai_responses.delta_event(item_id, pending))
-                            pending = await asyncio.to_thread(next, gen, None)
+                        kind, pending = first
+                        while kind is not None:
+                            if kind == "reasoning":
+                                yield _sse_dump(openai_responses.reasoning_delta_event(item_id, pending))
+                            else:
+                                collected.append(pending)
+                                yield _sse_dump(openai_responses.delta_event(item_id, pending))
+                            kind, pending = await asyncio.to_thread(next, gen, (None, None))
                         yield _sse_dump(openai_responses.completed_event(
                             _response("".join(collected))))
                     except AdapterError as exc:
@@ -495,7 +505,8 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                                                   "X-Accel-Buffering": "no"})
 
             def run() -> str:
-                return "".join(service.chat_stream(req, meta=meta))
+                return "".join(t for kind, t in service.chat_stream(req, meta=meta)
+                               if kind == "answer")
 
             text = await asyncio.to_thread(run)
             return JSONResponse(status_code=200, content=_response(text))

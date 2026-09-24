@@ -269,7 +269,7 @@ def test_chat_does_not_touch_video_quota_when_video_capped(piped):
         pool.report_submitted("a@x.cn")
         pool.report_submitted("b@x.cn")
     req = openai_chat.parse_openai_chat_request(dict(CHAT_BODY))
-    assert "".join(service.chat_stream(req)) == "你好，世界"
+    assert "".join(t for k, t in service.chat_stream(req) if k == "answer") == "你好，世界"
 
 
 def test_chat_quota_error_cools_short(piped, monkeypatch):
@@ -286,7 +286,7 @@ def test_chat_quota_error_cools_short(piped, monkeypatch):
     monkeypatch.setattr(client, "new_chat", boom)
     req = openai_chat.parse_openai_chat_request(dict(CHAT_BODY))
     with pytest.raises(QuotaExhaustedError):
-        "".join(service.chat_stream(req))
+        "".join(t for k, t in service.chat_stream(req) if k == "answer")
     state = pool.get_state("a@x.cn")
     assert state.cooldown_reason == "refused"
     assert state.cooldown_until - time.time() < 120, "必须是短冷，不是冷到 UTC 日界"
@@ -379,6 +379,39 @@ def test_stream_ping_comments_during_silence(settings, fake_upstream):
             raw = "".join(resp.iter_text())
     assert ": ping" in raw, "静默期应出现 SSE 注释心跳"
     assert "你好，世界" in raw.replace(" ", "") or "你好" in raw, "正文不受 ping 影响"
+
+
+SSE_THINKING_EXTRA = (
+    'data: {"response.created":{"chat_id":"chat-1"}}\n\n'
+    'data: {"choices":[{"delta":{"role":"assistant","content":"","phase":"thinking_summary",'
+    '"status":"typing","extra":{"summary_title":{"content":["分析问题"]},'
+    '"summary_thought":{"content":["第一步要点"]}}}}]}\n\n'
+    'data: {"choices":[{"delta":{"role":"assistant","content":"","phase":"thinking_summary",'
+    '"status":"typing","extra":{"summary_title":{"content":["分析问题","补充标题"]},'
+    '"summary_thought":{"content":["第一步要点","第二步要点"]}}}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"答案","phase":"answer","role":"assistant",'
+    '"status":"typing"}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"","phase":"answer","role":"assistant",'
+    '"status":"finished"}}]}\n\n'
+)
+
+
+def test_reasoning_content_passthrough(client_app):
+    """🔴 思考摘要透传：thinking_summary.extra 的分步增量 → delta.reasoning_content
+    （真实上游数据，官网 UI 同款；diff 只发新增条目）。"""
+    test_client, fake, _, _ = client_app
+    fake.chat_sse_body = SSE_THINKING_EXTRA
+    with test_client.stream("POST", CHAT_PATH, json={**CHAT_BODY, "stream": True},
+                            headers=AUTH_A) as resp:
+        raw = "".join(resp.iter_text())
+    events = [json.loads(ln[len("data:"):]) for ln in raw.splitlines()
+              if ln.startswith("data:") and "[DONE]" not in ln]
+    reasoning = [e["choices"][0]["delta"].get("reasoning_content") for e in events
+                 if e.get("choices") and "reasoning_content" in e["choices"][0]["delta"]]
+    assert reasoning == ["【分析问题】\n第一步要点", "【补充标题】\n第二步要点"], reasoning
+    content = "".join(e["choices"][0]["delta"].get("content") or ""
+                      for e in events if e.get("choices"))
+    assert "答案" in content
 
 
 def test_thinking_gear_fast_skips_heartbeat_and_uses_fast_config(client_app):

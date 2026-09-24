@@ -384,8 +384,13 @@ class QwenClient:
         return task_id
 
     def stream_chat(self, token: str, chat_id: str, body: dict, *,
-                    extra_cookies: str = "", meta: dict | None = None) -> Iterator[str]:
-        """提交 t2t 并打开上游流，返回**增量文本**迭代器（翻译层再加工成 OpenAI chunk）。
+                    extra_cookies: str = "", meta: dict | None = None
+                    ) -> Iterator[tuple[str, str]]:
+        """提交 t2t 并打开上游流，返回 `(kind, text)` 增量迭代器。
+
+        kind ∈ {"answer", "reasoning"}：answer = 正文增量（翻译层转 `delta.content`）；
+        reasoning = 思考摘要增量（`thinking_summary.extra` 的分步标题/要点，
+        转成 `delta.reasoning_content` —— 官网 UI 同款数据，2026-09-24 实测）。
 
         🔴 请求建立（HTTP 状态 / `x-actual-status-code` / WAF / RGV587）在**返回前**完成：
         失败在这里就抛，调用方还能回正经 HTTP 错误；进入迭代后的失败只能走流内错误事件。
@@ -394,7 +399,8 @@ class QwenClient:
 
         流形态（2026-09-24 单发实测，UPSTREAM §4.5；U-12 已关闭）：
           · 增量正文在 `choices[0].delta.content`（`phase:"answer"`）；
-          · `phase:"thinking_summary"` 事件 content 恒空（摘要正文在 extra 里）⇒ 不提取、不污染；
+          · `phase:"thinking_summary"` 事件 content 恒空，**思考摘要在 `delta.extra`**
+            （summary_title / summary_thought 数组逐步累加）⇒ diff 后走 reasoning 通道；
           · `data: {"error": …}` = **HTTP 200 里的流内错误事件** ⇒ 响亮失败（绝不静默吞）；
           · `delta.status=="finished"` = 结束事件（流**没有** `data: [DONE]`）⇒ 读到即收流；
           · `usage`（input/output/total_tokens）随 answer 事件出现且**逐事件递增** ⇒
@@ -437,8 +443,33 @@ class QwenClient:
             raise UpstreamError(
                 f"chat 提交：上游 HTTP {resp.status_code}/actual {actual}: {snippet[:200]}")
 
-        def iterate() -> Iterator[str]:
+        def iterate() -> Iterator[tuple[str, str]]:
+            """产出 `(kind, text)`：kind ∈ {"answer", "reasoning"}。
+
+            🔴 reasoning 通道（2026-09-24 实测，用户报「接口看不到思考内容」）：
+            `thinking_summary` 事件的 `delta.extra.summary_title / summary_thought`
+            是**逐步累加**的数组（官网 UI 的分步思考摘要）——对上一事件做 diff，
+            新增条目格式化为文本，经 `delta.reasoning_content` 透传（真实上游数据，
+            非编造；U-18 的「content 恒空」仅指 delta.content，extra 里一直有货）。
+            """
             extracted = 0
+            seen_title = 0
+            seen_thought = 0
+
+            def _reasoning_from(delta: dict) -> str:
+                nonlocal seen_title, seen_thought
+                extra = delta.get("extra") or {}
+                parts: list[str] = []
+                titles = ((extra.get("summary_title") or {}).get("content")) or []
+                thoughts = ((extra.get("summary_thought") or {}).get("content")) or []
+                for t in titles[seen_title:]:
+                    parts.append(f"【{str(t).strip()}】")
+                seen_title = len(titles)
+                for t in thoughts[seen_thought:]:
+                    parts.append(str(t).strip())
+                seen_thought = len(thoughts)
+                return "\n".join(p for p in parts if p)
+
             try:
                 for line in resp.iter_lines():
                     if not line:
@@ -464,10 +495,16 @@ class QwenClient:
                         raise UpstreamError(f"chat 流：上游流内错误事件：{error_text[:200]}")
                     if isinstance(event.get("usage"), dict) and meta is not None:
                         meta["usage"] = event["usage"]
+                    delta = (event.get("choices") or [{}])[0].get("delta", {}) \
+                        if isinstance(event.get("choices"), list) else {}
+                    if str(delta.get("phase") or "") == "thinking_summary":
+                        reasoning = _reasoning_from(delta)
+                        if reasoning:
+                            yield ("reasoning", reasoning)
                     text = extract_stream_text(event)
                     if text:
                         extracted += len(text)
-                        yield text
+                        yield ("answer", text)
                     if extract_stream_finished(event):
                         break
             finally:
