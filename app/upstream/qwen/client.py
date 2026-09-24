@@ -408,9 +408,14 @@ class QwenClient:
                 json=body, headers=headers)
             # 🔴 流式 read 单独放宽（per-request extensions）：thinking 期上游静默
             # 可达 50s+（U-18），客户端级 60s read 会把长思考误杀成 UpstreamTimeoutError。
-            request.extensions["timeout"] = httpx.Timeout(
-                connect=self.settings.upstream_timeout, read=180.0,
-                write=self.settings.upstream_timeout, pool=self.settings.upstream_timeout)
+            # 注意 httpx 的 per-request timeout 是 **dict** 形态（传 Timeout 对象会
+            # AttributeError: 'Timeout' object has no attribute 'get'，2026-09-24 实测踩坑）。
+            request.extensions["timeout"] = {
+                "connect": self.settings.upstream_timeout,
+                "read": 180.0,
+                "write": self.settings.upstream_timeout,
+                "pool": self.settings.upstream_timeout,
+            }
             resp = self._client.send(request, stream=True)
         except httpx.TimeoutException as exc:
             raise UpstreamTimeoutError(f"chat 提交超时：{exc}") from exc
