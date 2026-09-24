@@ -406,6 +406,11 @@ class QwenClient:
             request = self._client.build_request(
                 "POST", "/api/v2/chat/completions", params={"chat_id": chat_id},
                 json=body, headers=headers)
+            # 🔴 流式 read 单独放宽（per-request extensions）：thinking 期上游静默
+            # 可达 50s+（U-18），客户端级 60s read 会把长思考误杀成 UpstreamTimeoutError。
+            request.extensions["timeout"] = httpx.Timeout(
+                connect=self.settings.upstream_timeout, read=180.0,
+                write=self.settings.upstream_timeout, pool=self.settings.upstream_timeout)
             resp = self._client.send(request, stream=True)
         except httpx.TimeoutException as exc:
             raise UpstreamTimeoutError(f"chat 提交超时：{exc}") from exc

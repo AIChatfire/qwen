@@ -152,6 +152,9 @@ class Settings:
     upload_enabled: bool = True
     #: 附件大小上限（字节）——服务端代下载与上传共用此闸门。
     upload_max_bytes: int = 20_000_000
+    #: 流式静默 ping 间隔（秒）：上游静默超过该时长就发一条 SSE 注释（`: ping`）
+    #: 保活中间层（防 nginx/CDN/NAT idle 掐流 —— curl 92 根治）。纯代码字段，无 env 键。
+    ping_interval: float = 15.0
 
     # —— 任务持久化 ——
     task_db: str = ""

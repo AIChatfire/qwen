@@ -90,6 +90,7 @@ class FakeQwen:
         self.models_payload: list[dict] | None = None   # None ⇒ DEFAULT_MODELS
         self.models_fail = False                        # True ⇒ /api/models 回 503
         self.chat_sse_body: str | None = None           # None ⇒ SSE_T2T
+        self.chat_sse_delay: float = 0.0                # >0 ⇒ 每行 SSE 间隔秒数（测 ping）
 
     # ------------------------------------------------------------ 断言工具
 
@@ -131,8 +132,19 @@ class FakeQwen:
             body = json.loads(request.content)
             first = (body.get("messages") or [{}])[0]
             if first.get("chat_type") == "t2t":
+                sse_text = self.chat_sse_body or SSE_T2T
+                if self.chat_sse_delay:
+                    import time as _time
+
+                    def _slow_lines():
+                        for ln in sse_text.splitlines(keepends=True):
+                            _time.sleep(self.chat_sse_delay)
+                            yield ln.encode()
+
+                    return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                          content=_slow_lines())
                 return httpx.Response(200, headers={"content-type": "text/event-stream"},
-                                      content=(self.chat_sse_body or SSE_T2T).encode())
+                                      content=sse_text.encode())
             if self.fail_submits:
                 return httpx.Response(200, json=self.fail_submits.pop(0))
             if self.submit_response is not None:

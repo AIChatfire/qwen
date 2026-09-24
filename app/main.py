@@ -222,16 +222,34 @@ def create_app(settings: Settings | None = None, *, store: TaskStore | None = No
                     yield _sse_dump(openai_chat.chunk_object(
                         completion_id=completion_id, created=created,
                         model=req.model_requested, delta={"content": " "}))
+                ping_interval = getattr(settings, "ping_interval", 15.0)
                 pending: str | None = first
                 if pending_first:
-                    pending = await first_task   # 预检未到的首增量在流内回收
+                    # 预检未到首增量：等待期也发 ping（心跳空格已先行）
+                    while True:
+                        done_set, _ = await asyncio.wait({first_task}, timeout=ping_interval)
+                        if done_set:
+                            break
+                        yield ": ping\n\n"
+                    pending = first_task.result()
                 if pending is None:
                     raise UpstreamError("chat 流未产生任何增量（上游零输出按失败，不报成功）")
                 while pending is not None:
                     yield _sse_dump(openai_chat.chunk_object(
                         completion_id=completion_id, created=created,
                         model=req.model_requested, delta={"content": pending}))
-                    pending = await asyncio.to_thread(next, gen, None)
+                    # 🔴 周期 ping（用户 92 报障的根治）：上游 thinking/生成静默可达 50s+，
+                    # 客户端↔nginx 之间全程无字节的静默流会被中间层 idle 掐断（curl 92
+                    # HTTP/2 stream not closed cleanly）。每 ping_interval 发一条 SSE
+                    # 注释（`: ping`）——注释行对 OpenAI 解析器不可见、不污染正文，
+                    # 但让任何中间层都不再看到"静默流"。
+                    task = asyncio.ensure_future(asyncio.to_thread(next, gen, None))
+                    while True:
+                        done_set, _ = await asyncio.wait({task}, timeout=ping_interval)
+                        if done_set:
+                            break
+                        yield ": ping\n\n"
+                    pending = task.result()
                 yield _sse_dump(openai_chat.chunk_object(
                     completion_id=completion_id, created=created,
                     model=req.model_requested, delta={}, finish_reason="stop",

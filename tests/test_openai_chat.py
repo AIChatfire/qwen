@@ -358,6 +358,29 @@ def test_chat_stream_route(client_app):
     assert all(c["model"] == "qwen3.7-plus" for c in chunks)
 
 
+def test_stream_ping_comments_during_silence(settings, fake_upstream):
+    """🔴 curl 92 根治：上游静默超过 ping_interval ⇒ 流里出现 SSE 注释 `: ping`
+    （对 OpenAI 解析器不可见，但让中间层永不静默）。"""
+    import dataclasses
+
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    s = dataclasses.replace(settings, ping_interval=0.2)
+    fake_upstream.chat_sse_delay = 0.6   # 每行 SSE 间隔 0.6s ⇒ 静默窗口触发 ping
+    store = TaskStore(s.task_db)
+    pool = AccountPool(s, mint=lambda account: f"tok-{account.email}")
+    client = QwenClient(s, transport=fake_upstream.transport())
+    app = create_app(s, store=store, pool=pool, client=client)
+    with TestClient(app) as tc:
+        with tc.stream("POST", CHAT_PATH, json={**CHAT_BODY, "stream": True},
+                       headers=AUTH_A) as resp:
+            raw = "".join(resp.iter_text())
+    assert ": ping" in raw, "静默期应出现 SSE 注释心跳"
+    assert "你好，世界" in raw.replace(" ", "") or "你好" in raw, "正文不受 ping 影响"
+
+
 def test_thinking_gear_fast_skips_heartbeat_and_uses_fast_config(client_app):
     """reasoning_effort=none ⇒ 快速档：无思考心跳 + 上游收到 thinking_enabled false。"""
     test_client, fake, _, _ = client_app
