@@ -15,6 +15,9 @@ from pathlib import Path
 UA_DEFAULT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 
+#: 能力回退通道（火山方舟 chat，`app/ark_fallback.py`）的默认端点（北京 region）。
+ARK_DEFAULT_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -130,6 +133,26 @@ class Settings:
     api_keys: list[str] = field(default_factory=list)
     key_secret: str = ""
 
+    # —— OpenAI chat 门（/v1/chat/completions + /v1/models 注册） ——
+    #: 上游模型清单（`GET /api/models`，免鉴权）的缓存时长（秒）。
+    #: 到期才拉一次；拉取失败回退上一份好清单（负缓存同样顺延本值）。
+    models_cache_ttl: float = 300.0
+
+    # —— 能力回退通道（chat 门；qwen 不支持的能力 → 方舟 chat，见 app/ark_fallback.py） ——
+    #: 🔴 KEY 与 MODEL **同时**配置才启用；只配一个 ⇒ from_env 响亮失败（半启用最容易误判）。
+    ark_fallback_base: str = ARK_DEFAULT_BASE
+    ark_fallback_key: str = ""
+    ark_fallback_model: str = ""
+    #: **备用回退模型链**（逗号分隔，按序 failover）：主模型被方舟限流（429）⇒
+    #: 依次切换重试；全部被限 ⇒ 429 原样转发。所有模型名都只从 env 来，出站报文一律脱敏。
+    ark_fallback_models: list[str] = field(default_factory=list)
+    ark_fallback_timeout: float = 120.0
+
+    # —— 附件上传链（chat 门；文件/音频/视频/data: 图 → getstsToken → OSS PUT，UPSTREAM §4.7） ——
+    upload_enabled: bool = True
+    #: 附件大小上限（字节）——服务端代下载与上传共用此闸门。
+    upload_max_bytes: int = 20_000_000
+
     # —— 任务持久化 ——
     task_db: str = ""
     data_dir: str = ""
@@ -149,6 +172,15 @@ class Settings:
         env = environ if environ is not None else os.environ
         data_dir = _env(env, "DATA_DIR") or str(REPO_ROOT / "var")
         task_db = _env(env, "TASK_DB") or f"sqlite:///{data_dir}/qwen.db"
+        ark_base = _env(env, "ARK_FALLBACK_BASE")
+        ark_key = _env(env, "ARK_FALLBACK_KEY")
+        ark_model = _env(env, "ARK_FALLBACK_MODEL")
+        ark_models = [m.strip() for m in _env(env, "ARK_FALLBACK_MODELS").split(",") if m.strip()]
+        if (ark_base or ark_key or ark_model or ark_models) and not (ark_key and ark_model):
+            raise ValueError(
+                "回退通道配置不完整：启用需 ARK_FALLBACK_KEY 与 ARK_FALLBACK_MODEL 同时设置"
+                "（ARK_FALLBACK_BASE / ARK_FALLBACK_MODELS 可选）"
+                "—— 半启用状态最容易误判，刻意拒绝启动")
         return cls(
             upstream_base=_env(env, "QWEN_BASE_URL") or "https://chat.qwen.ai",
             chat_model=_env(env, "QWEN_CHAT_MODEL") or "qwen3.7-plus",
@@ -172,6 +204,14 @@ class Settings:
             queue_retry_base=_num(env, "QUEUE_RETRY_BASE", 30.0),
             api_keys=[p.strip() for p in _env(env, "API_KEYS").split(",") if p.strip()],
             key_secret=_env(env, "KEY_SECRET"),
+            models_cache_ttl=_num(env, "MODELS_CACHE_TTL", 300.0),
+            ark_fallback_base=ark_base or ARK_DEFAULT_BASE,
+            ark_fallback_key=ark_key,
+            ark_fallback_model=ark_model,
+            ark_fallback_models=ark_models,
+            ark_fallback_timeout=_num(env, "ARK_FALLBACK_TIMEOUT", 120.0),
+            upload_enabled=_bool(env, "QWEN_UPLOAD_ENABLED", True),
+            upload_max_bytes=_num(env, "QWEN_UPLOAD_MAX_BYTES", 20_000_000.0),
             task_db=task_db,
             data_dir=data_dir,
             poll_interval=_num(env, "POLL_INTERVAL", 3.0),
@@ -193,6 +233,11 @@ class Settings:
     @property
     def ready(self) -> bool:
         return bool(self.accounts)
+
+    @property
+    def ark_fallback_enabled(self) -> bool:
+        """回退通道开关：KEY + MODEL 都配置才启用（空 = 关闭，回到降级/400 行为）。"""
+        return bool(self.ark_fallback_key and self.ark_fallback_model)
 
     def resolved_key_secret(self) -> str:
         """HMAC 指纹密钥：env 优先；否则在 data_dir 落一个 600 的随机值（重启不变）。

@@ -8,11 +8,16 @@
      `{"code":"Bad_Request"}`（文案像"请求体写错了"，极易误诊）；`chats/new` 不要求。
   3. **查询端点 HTTP 恒 200**：真码在响应头 `x-actual-status-code`；body 里 `success`
      才可信。**不得把 `task_status` 缺失解释成"还在跑"**（会无限轮询）。
+
+chat（t2t）门（2026-09-24 新增）：请求体逐字对齐当日用户抓包；**流式响应事件形态未证实**
+（UPSTREAM §9 U-12）⇒ `stream_chat` 的文本提取走宽容多路径，**零提取 ⇒ 响亮失败**。
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import datetime
 
 import httpx
@@ -30,10 +35,10 @@ from ...errors import (
 from .accounts import mask_email
 
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May",
+           "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
-#: 与抓包逐字一致的提交体固定片段。
+#: 与抓包逐字一致的提交体固定片段（视频 t2v/i2v：thinking 关）。
 FEATURE_CONFIG = {
     "thinking_enabled": False,
     "output_schema": "phase",
@@ -43,11 +48,83 @@ FEATURE_CONFIG = {
     "auto_search": True,
 }
 
+#: t2t 抓包（2026-09-24）的 feature_config —— **逐字**：thinking 开、thinking_mode=Thinking、
+#: thinking_format=summary（视频片段里没有这个键）。别拿它跟 FEATURE_CONFIG"合并"。
+CHAT_FEATURE_CONFIG = {
+    "thinking_enabled": True,
+    "output_schema": "phase",
+    "research_mode": "normal",
+    "auto_thinking": True,
+    "thinking_mode": "Thinking",
+    "thinking_format": "summary",
+    "auto_search": True,
+}
+
 
 def tz_header() -> str:
     now = datetime.now()
     return (f"{_WEEKDAYS[now.weekday()]} {_MONTHS[now.month - 1]} {now.day:02d} "
             f"{now.year} {now.hour:02d}:{now.minute:02d}:{now.second:02d} GMT+0800")
+
+
+def extract_stream_text(event: object) -> str:
+    """从一条 SSE 事件里提取**增量文本**（形态 2026-09-24 实测，见 UPSTREAM §4.5）。
+
+    覆盖的候选路径（按序尝试，取到即返回；宽容多路径 = 防上游改形态时静默挂死）：
+      · `choices[0].delta.content`（实测路径，`phase:"answer"` 的正文增量）
+      · `choices[0].message.content`（整段形态）
+      · `data.choices[0].delta.content` / `data.choices[0].message.content`
+        （上游其它端点习惯把业务体包在 `data` 里，防它把这套习惯带进 SSE）
+    `phase:"thinking_summary"` 事件的 content 恒为空串 ⇒ 天然不提取（thinking 摘要在
+    `extra.summary_*` 里，v1 不透传）；`reasoning_content` 等旁路字段同样不提取。
+    """
+    if not isinstance(event, dict):
+        return ""
+    candidates: list[object] = [event, event.get("data")]
+    for root in candidates:
+        if not isinstance(root, dict):
+            continue
+        choices = root.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        first = choices[0]
+        if not isinstance(first, dict):
+            continue
+        for holder in (first.get("delta"), first.get("message")):
+            if isinstance(holder, dict) and isinstance(holder.get("content"), str) \
+                    and holder["content"]:
+                return holder["content"]
+    return ""
+
+
+def extract_stream_error(event: object) -> str:
+    """流内错误事件（**HTTP 200 包着错误**，2026-09-24 实测两种形态）：
+    `{"error": "Internal error!"}` 与 `{"error": {"code": "invalid_input", "details": …}}`。
+    有错误给一句可读描述，没有回空串。"""
+    if not isinstance(event, dict) or "error" not in event:
+        return ""
+    error = event.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        code = str(error.get("code") or "")
+        details = str(error.get("details") or error.get("message") or "")
+        return f"{code} {details}".strip() or json.dumps(error, ensure_ascii=False)
+    return str(error)
+
+
+def extract_stream_finished(event: object) -> bool:
+    """"结束"事件判据（2026-09-24 实测：`delta.status == "finished"` **且 `phase == "answer"`**；
+    流没有 `data: [DONE]`。⚠️ thinking 摘要的结束事件也带 `status:"finished"` ——
+    只差 phase 一个键，判宽了会把整条流在思考阶段就掐断）。"""
+    if not isinstance(event, dict):
+        return False
+    choices = event.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    delta = choices[0].get("delta")
+    return (isinstance(delta, dict) and delta.get("status") == "finished"
+            and delta.get("phase") == "answer")
 
 
 class QwenClient:
@@ -65,13 +142,15 @@ class QwenClient:
 
     # ------------------------------------------------------------------ 头部
 
-    def headers(self, token: str, *, referer: str | None = None,
+    def headers(self, token: str | None = None, *, referer: str | None = None,
                 extra_cookies: str = "") -> dict[str, str]:
+        """请求头（照 `biz-api::build_headers` 逐字段对齐）。
+
+        `token=None` ⇒ 不带 `Cookie`（`GET /api/models` 实测免鉴权，见 UPSTREAM §1）；
+        `extra_cookies` 只在给了 token 时拼接（无凭据的公共端点没有"附加 cookie"语义）。
+        """
         s = self.settings
-        cookie = f"token={token}"
-        if extra_cookies:
-            cookie = f"{cookie}; {extra_cookies}"
-        return {
+        headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": s.user_agent,
@@ -90,8 +169,13 @@ class QwenClient:
             "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
-            "Cookie": cookie,
         }
+        if token or extra_cookies:
+            cookie = f"token={token}" if token else ""
+            if extra_cookies:
+                cookie = f"{cookie}; {extra_cookies}" if cookie else extra_cookies
+            headers["Cookie"] = cookie
+        return headers
 
     # ------------------------------------------------------------------ 判读
 
@@ -139,13 +223,18 @@ class QwenClient:
 
     # ------------------------------------------------------------------ 端点
 
-    def new_chat(self, token: str, *, extra_cookies: str = "") -> str:
-        """建会话。返回 `data.id`（作 chat_id，可长期复用）。"""
+    def new_chat(self, token: str, *, chat_type: str = "t2v", model: str | None = None,
+                 extra_cookies: str = "") -> str:
+        """建会话。返回 `data.id`（作 chat_id，可长期复用）。
+
+        `chat_type` / `model` 可参数化：chat（t2t）门用 `chat_type="t2t"` + 请求的模型
+        （⚠️ 这两个参数对 t2t 会话的影响未证实，见 UPSTREAM §9 U-13；视频门行为不变）。
+        """
         body = {
             "title": "New Chat",
-            "models": [self.settings.chat_model],
+            "models": [model or self.settings.chat_model],
             "chat_mode": "normal",
-            "chat_type": "t2v",
+            "chat_type": chat_type,
             "timestamp": int(time.time() * 1000),
             "project_id": "",
         }
@@ -162,7 +251,7 @@ class QwenClient:
     def build_submit_body(self, chat_id: str, *, prompt: str, ratio: str, chat_type: str,
                           image_url: str | None, chat_model: str | None = None,
                           ts: int | None = None) -> dict:
-        """提交体构造（纯函数；dry_run 也走这里，保证"预演即真发"）。"""
+        """视频提交体构造（纯函数；dry_run 也走这里，保证"预演即真发"）。"""
         from ... import media
 
         model = chat_model or self.settings.chat_model
@@ -201,6 +290,54 @@ class QwenClient:
             "size": ratio,
         }
 
+    def build_chat_submit_body(self, chat_id: str, *, model: str, prompt: str,
+                               files: list[dict] | None = None,
+                               ts: int | None = None) -> dict:
+        """t2t 提交体 —— 逐字对齐 2026-09-24 用户抓包（纯函数；dry_run 也走这里）。
+
+        与视频体（`build_submit_body`）的实证差异：
+          · `stream: True`（视频用 stream:false 拿同步 task_id；t2t 抓包即流式）；
+          · **没有 `size`**（顶层与 extra.meta 都没有 —— 文本任务无画幅）；
+          · `feature_config` thinking 开（`CHAT_FEATURE_CONFIG`，多 `thinking_format` 键）。
+        与视频体**相同**的（2026-09-24 真实一发已证）：
+          · 顶层 `chatId` 与小写 `chat_id` **双写**（缺小写 ⇒ 上游 400
+            `RequestValidationError: Field 'chat_id': Field required`）；
+          · `messages[0].id` 为 `null`；
+          · `messages[0].files` 恒在（纯文本为 `[]`；多模态解析时放 files 条目）。
+        """
+        now = int(ts if ts is not None else time.time())
+        message = {
+            "id": None,
+            "fid": str(uuid.uuid4()),
+            "parentId": None,
+            "childrenIds": [str(uuid.uuid4())],
+            "role": "user",
+            "content": prompt,
+            "user_action": "chat",
+            "files": list(files or []),
+            "timestamp": now,
+            "models": [model],
+            "model": "",
+            "chat_type": "t2t",
+            "feature_config": dict(CHAT_FEATURE_CONFIG),
+            "extra": {"meta": {"subChatType": "t2t"}},
+            "sub_chat_type": "t2t",
+            "parent_id": None,
+        }
+        return {
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chatId": chat_id,
+            "parentId": "",
+            "chat_id": chat_id,
+            "chat_mode": "normal",
+            "model": model,
+            "parent_id": None,
+            "messages": [message],
+            "timestamp": now,
+        }
+
     def submit_video(self, token: str, *, chat_id: str, prompt: str, ratio: str,
                      chat_type: str, image_url: str | None, extra_cookies: str = "",
                      chat_model: str | None = None) -> str:
@@ -229,6 +366,123 @@ class QwenClient:
                 "提交响应里没有 task_id（期望路径 data.messages[0].extra.wanx.task_id）")
         return task_id
 
+    def stream_chat(self, token: str, chat_id: str, body: dict, *,
+                    extra_cookies: str = "", meta: dict | None = None) -> Iterator[str]:
+        """提交 t2t 并打开上游流，返回**增量文本**迭代器（翻译层再加工成 OpenAI chunk）。
+
+        🔴 请求建立（HTTP 状态 / `x-actual-status-code` / WAF / RGV587）在**返回前**完成：
+        失败在这里就抛，调用方还能回正经 HTTP 错误；进入迭代后的失败只能走流内错误事件。
+        🔴 401 在这里抛 `AuthenticationError` —— `_authed_call` 会重铸 token 后重试一次
+        （上游 401 = 未受理，重试不会重复提交）。
+
+        流形态（2026-09-24 单发实测，UPSTREAM §4.5；U-12 已关闭）：
+          · 增量正文在 `choices[0].delta.content`（`phase:"answer"`）；
+          · `phase:"thinking_summary"` 事件 content 恒空（摘要正文在 extra 里）⇒ 不提取、不污染；
+          · `data: {"error": …}` = **HTTP 200 里的流内错误事件** ⇒ 响亮失败（绝不静默吞）；
+          · `delta.status=="finished"` = 结束事件（流**没有** `data: [DONE]`）⇒ 读到即收流；
+          · `usage`（input/output/total_tokens）随 answer 事件出现且**逐事件递增** ⇒
+            写入 `meta["usage"]`（最后一份即终值，真实数据，由调用方透传）。
+        """
+        headers = self.headers(token, referer=f"{self.settings.base_url}/c/{chat_id}",
+                               extra_cookies=extra_cookies)
+        try:
+            request = self._client.build_request(
+                "POST", "/api/v2/chat/completions", params={"chat_id": chat_id},
+                json=body, headers=headers)
+            resp = self._client.send(request, stream=True)
+        except httpx.TimeoutException as exc:
+            raise UpstreamTimeoutError(f"chat 提交超时：{exc}") from exc
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"chat 提交传输失败：{type(exc).__name__}: {exc}") from exc
+
+        raw_actual = resp.headers.get("x-actual-status-code", "")
+        try:
+            actual = int(raw_actual) if raw_actual.strip().isdigit() else resp.status_code
+        except ValueError:  # pragma: no cover - 防御
+            actual = resp.status_code
+        if resp.status_code >= 400 or actual >= 400:
+            snippet = resp.read()[:200].decode("utf-8", "replace")
+            resp.close()
+            if actual == 401 or resp.status_code == 401:
+                raise AuthenticationError("chat 提交：上游凭据失效（Unauthorized）")
+            if actual == 404:
+                raise NotFoundError("chat 提交：上游会话不存在")
+            raise UpstreamError(
+                f"chat 提交：上游 HTTP {resp.status_code}/actual {actual}: {snippet[:200]}")
+
+        def iterate() -> Iterator[str]:
+            extracted = 0
+            try:
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    if "aliyun_waf" in line:
+                        raise UpstreamError("chat 流：上游返回 WAF 挑战页（凭据/出口问题）")
+                    if "RGV587" in line or "FAIL_SYS_USER_VALIDATE" in line:
+                        raise RiskControlError(
+                            "chat 流：上游 x5sec 风控（RGV587）", retry_after=60.0)
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":     # 实测流没有 DONE；容忍网关注入
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except ValueError:
+                        continue    # 心跳/注释行：忽略，不算失败
+                    if not isinstance(event, dict):
+                        continue
+                    error_text = extract_stream_error(event)
+                    if error_text:
+                        raise UpstreamError(f"chat 流：上游流内错误事件：{error_text[:200]}")
+                    if isinstance(event.get("usage"), dict) and meta is not None:
+                        meta["usage"] = event["usage"]
+                    text = extract_stream_text(event)
+                    if text:
+                        extracted += len(text)
+                        yield text
+                    if extract_stream_finished(event):
+                        break
+            finally:
+                resp.close()
+            if extracted == 0:
+                raise UpstreamError(
+                    "chat 流：上游流式响应未提取到任何文本 —— SSE 事件形态与实测不符"
+                    "（对照 UPSTREAM §4.5；请带原始响应到 docs/UPSTREAM.md 登记）")
+
+        return iterate()
+
+    def list_upstream_models(self) -> list[dict]:
+        """`GET /api/models` —— 上游模型清单（**免鉴权**，2026-09-24 实测：无任何 cookie 即 200）。
+
+        只读、免费、短超时（5s）：它挂在免 Key 的 `/v1/models` 后面，不能拖慢能力探测。
+        返回原始条目列表（映射/过滤在 `app/models.py`）。
+        """
+        try:
+            resp = self._client.get("/api/models", headers=self.headers(None), timeout=5.0)
+        except httpx.TimeoutException as exc:
+            raise UpstreamTimeoutError(f"api/models 超时：{exc}") from exc
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"api/models 传输失败：{type(exc).__name__}: {exc}") from exc
+        payload = self._decode(resp, op="api/models")
+        data = payload.get("data") if isinstance(payload.get("data"), list) else []
+        return [item for item in data if isinstance(item, dict)]
+
+    def upload_attachment(self, token: str, *, kind: str, filename: str,
+                          content_type: str, data: bytes,
+                          extra_cookies: str = "") -> dict:
+        """附件上传链：getstsToken → OSS V4 签名 PUT → files[] 条目（UPSTREAM §4.7 实测契约）。
+
+        🔴 预签名 `file_url` 不可用（SignatureDoesNotMatch）——必须用 STS 凭证自签，
+        派生前缀是 **`aliyun_v4`**（非 aliyun_v4_request，见 `upload.py` docstring）。
+        """
+        from .upload import upload_attachment as _upload
+
+        return _upload(self._client, token, kind=kind, filename=filename,
+                       content_type=content_type, data=data,
+                       headers_fn=lambda tok, referer=None: self.headers(
+                           tok, referer=referer, extra_cookies=extra_cookies))
+
     def task_status(self, token: str, task_id: str, *, extra_cookies: str = "") -> dict:
         """查询任务。返回 `{actual_status_code, success, data}`（不做状态解释）。"""
         try:
@@ -250,4 +504,11 @@ class QwenClient:
         return {"actual_status_code": actual, "success": bool(payload.get("success")), "data": data}
 
 
-__all__ = ["QwenClient", "FEATURE_CONFIG", "mask_email", "tz_header"]
+__all__ = [
+    "CHAT_FEATURE_CONFIG",
+    "FEATURE_CONFIG",
+    "QwenClient",
+    "extract_stream_text",
+    "mask_email",
+    "tz_header",
+]

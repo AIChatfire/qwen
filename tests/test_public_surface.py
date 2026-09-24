@@ -27,6 +27,8 @@ ALLOWED_HOSTS: dict[str, str] = {
     "chat.qwen.ai": "服务对象（上游）",
     "cdn.qwenlm.ai": "上游产物 CDN",
     "qwen-chat.oss-ap-southeast-1.aliyuncs.com": "i2v 冒烟用的上游样例图",
+    "ark.cn-beijing.volces.com": "能力回退通道端点（火山方舟公开云服务，Interface §10）",
+    "oss-accelerate.aliyuncs.com": "附件上传链 OSS 端点（阿里云公开云服务，UPSTREAM §4.7）",
     "ghcr.io": "镜像仓库（CI 推送目标）",
     "github.com": "仓库/文档链接",
     "users.noreply.github.com": "发布流水线的 bot 提交身份（公开域名）",

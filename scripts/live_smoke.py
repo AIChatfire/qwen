@@ -6,11 +6,15 @@
     python scripts/live_smoke.py dryrun [--kind t2v|i2v] [--base http://127.0.0.1:8400]
     python scripts/live_smoke.py run    [--kind t2v|i2v] [--image URL]
                                         [--interval 8] [--timeout 600] [--out var/live]
+    python scripts/live_smoke.py chat   [--prompt TEXT] [--model ID] [--stream]
+                                        [--key KEY] [--base http://127.0.0.1:8400]
 
 纪律：
   · `signin` 免费但**必须走轮换出口**（本脚本直接调 signin 模块，不经服务）；
-  · `dryrun` 零成本（不触上游）；
-  · `run` **每次真实消耗 1 次视频额度**（3 次/天/账号）——发之前想清楚。
+  · `dryrun` / chat 门的 `X-Avm-Dry-Run` 零成本（不触上游）；
+  · `run` **每次真实消耗 1 次视频额度**（3 次/天/账号）——发之前想清楚；
+  · `chat` 真实一发 **t2t 文本对话**（免费、不消耗视频额度，但仍是真实上游写请求）——
+    首次运行请回填 `docs/UPSTREAM.md` U-12/U-13（流式响应形态 / chats/new 参数影响）。
 本脚本刻意用 `trust_env=False`（与服务同口径），避免沙箱透明代理接管。
 """
 from __future__ import annotations
@@ -31,7 +35,9 @@ from app.config import Settings  # noqa: E402
 EXAMPLE_IMAGE = "https://qwen-chat.oss-ap-southeast-1.aliyuncs.com/resources/i2v/1762498392.png"
 PROMPT_T2V = "一只橘猫坐在窗台上看雨，窗外霓虹灯光映在玻璃上，电影感镜头缓慢推进"
 PROMPT_I2V = "潜水员在深海中缓缓转身，探照灯光束扫过沉船残骸，鱼群四散"
+PROMPT_CHAT = "用一句话介绍你自己"
 TASKS = "/api/v3/contents/generations/tasks"
+CHAT = "/v1/chat/completions"
 
 
 def mp4_duration_seconds(path: Path) -> float | None:
@@ -135,6 +141,54 @@ def cmd_run(args) -> int:
         return 0
 
 
+def cmd_chat(args) -> int:
+    """真实一发 t2t（免费、不耗视频额度）。验证 U-12（SSE 形态）/ U-13（chats/new 参数）。"""
+    payload = {"model": args.model or "qwen3.7-plus", "stream": bool(args.stream),
+               "messages": [{"role": "user", "content": args.prompt}]}
+    headers = {"Authorization": f"Bearer {args.key}"} if args.key else {}
+    started = time.time()
+    with httpx.Client(base_url=args.base, timeout=120, trust_env=False) as client:
+        if args.stream:
+            pieces: list[str] = []
+            with client.stream("POST", CHAT, json=payload, headers=headers) as resp:
+                print(f"[chat] HTTP {resp.status_code} content-type={resp.headers.get('content-type')}")
+                if resp.status_code != 200:
+                    print(resp.read().decode("utf-8", "replace")[:600])
+                    return 1
+                for line in resp.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    chunk = line[len("data:"):].strip()
+                    if chunk == "[DONE]":
+                        print("\n[chat] [DONE]")
+                        break
+                    try:
+                        event = json.loads(chunk)
+                        delta = event["choices"][0].get("delta", {})
+                        text = delta.get("content") or ""
+                    except (ValueError, KeyError, IndexError):
+                        text = ""
+                        print(f"[chat] (未识别事件形态，原样) {chunk[:200]}")
+                    if text:
+                        pieces.append(text)
+                        print(text, end="", flush=True)
+            text = "".join(pieces)
+        else:
+            resp = client.post(CHAT, json=payload, headers=headers)
+            print(f"[chat] HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                print(resp.text[:600])
+                return 1
+            data = resp.json()
+            print(json.dumps({k: data.get(k) for k in ("id", "object", "model", "degradations")},
+                             ensure_ascii=False))
+            text = data["choices"][0]["message"]["content"]
+    print(f"[chat] 回复 {len(text)} 字，耗时 {time.time() - started:.1f}s")
+    print(f"[chat] content: {text[:400]}")
+    print("[chat] 请把上游实际 SSE 形态回填 docs/UPSTREAM.md U-12（含原始事件样本，脱敏）")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -153,6 +207,14 @@ def main(argv=None) -> int:
         p.add_argument("--timeout", type=float, default=600.0)
         p.add_argument("--out", default=str(REPO_ROOT / "var" / "live"))
         p.set_defaults(func=fn)
+
+    p_chat = sub.add_parser("chat", help="真实一发 t2t 对话（免费，不耗视频额度）")
+    p_chat.add_argument("--prompt", default=PROMPT_CHAT)
+    p_chat.add_argument("--model", default="", help="默认 qwen3.7-plus（也可用 /v1/models 里注册的任一 chat 模型）")
+    p_chat.add_argument("--stream", action="store_true", help="走流式（观察 SSE 增量）")
+    p_chat.add_argument("--key", default="", help="服务 API Key（服务开了 API_KEYS 时必填）")
+    p_chat.add_argument("--base", default="http://127.0.0.1:8400")
+    p_chat.set_defaults(func=cmd_chat)
 
     args = parser.parse_args(argv)
     return args.func(args)

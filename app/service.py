@@ -1,7 +1,7 @@
 """业务编排 —— 创建 / 查询 / 轮询 / **轻量排队重试**；账号归属与凭据绑定在这里收口。
 
 职责边界：
-  · `ark.py` 只做纯翻译（无 IO）；
+  · `ark.py` 只做纯翻译（无 IO）；`openai_chat.py` 同理（OpenAI chat 门）；
   · `upstream/qwen/*` 只做上游交互（不写任务表）；
   · **本模块**决定"谁来跑、状态怎么落、错误怎么分类回报、要不要排队重试"。
 
@@ -12,6 +12,10 @@
     建任务是计费动作，**含义不明的失败（5xx/超时）绝不自动重试**（防重复计费）；
   · **背压仍保留**：排队深度超 `QUEUE_MAX_DEPTH` ⇒ 照旧 429 + Retry-After；
   · **重启不丢**：queued / running 都在任务表里；重启后协调器 / GET 继续推进。
+
+chat 门（2026-09-24 新增，`chat_stream`）：**同步链路、无任务表、无排队** ——
+chat 不消耗视频额度（取号走 `acquire_chat`，不看 `day_used`），失败照常按类冷却账号；
+每个请求新建上游会话（无状态；多轮历史由调用方自带，见 `openai_chat.py` 的拍平口径）。
 """
 from __future__ import annotations
 
@@ -20,7 +24,7 @@ import random
 import string
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from .ark import CreatePlan, ark_task_view, translate_ark_create
@@ -36,6 +40,7 @@ from .errors import (
     UpstreamError,
     UpstreamTimeoutError,
 )
+from .openai_chat import ChatRequest
 from .store import TERMINAL_STATUSES, TaskRecord, TaskStore
 from .upstream.qwen.accounts import AccountPool, AccountState, mask_email
 from .upstream.qwen.client import QwenClient
@@ -47,16 +52,20 @@ _LOCAL_ID_ALPHABET = string.ascii_lowercase + string.digits
 
 class QwenVideoService:
     def __init__(self, settings: Settings, store: TaskStore, pool: AccountPool,
-                 client: QwenClient) -> None:
+                 client: QwenClient, *, attachment_resolver=None) -> None:
         self.settings = settings
         self.store = store
         self.pool = pool
         self.client = client
+        #: 附件来源解析器（http(s)/data: → bytes）：默认 `media.resolve_attachment`
+        #: （SSRF 防护 + 大小上限）；测试可注入假实现。
+        from . import media as _media
+        self._resolve = attachment_resolver or _media.resolve_attachment
         #: 同一任务的提交尝试互斥：协调器与 GET 可能并发推进同一条 queued 记录
         self._submit_guard = threading.Lock()
         self._submitting: set[str] = set()
 
-    # ------------------------------------------------------------------ 创建
+    # ------------------------------------------------------------------ 创建（方舟门）
 
     def create(self, body: dict, credential_id: str, *, dry_run: bool = False) -> dict:
         """方舟创建请求 → `{"id": "cgt-…"}`（dry_run 时返回"将要发出的请求"）。"""
@@ -235,6 +244,72 @@ class QwenVideoService:
         stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime(now))
         tail = "".join(random.choices(_LOCAL_ID_ALPHABET, k=5))
         return f"cgt-{stamp}-{tail}"
+
+    # ------------------------------------------------------------------ chat 门（OpenAI）
+
+    def chat_dry_run(self, req: ChatRequest) -> dict:
+        """chat 门的预演：跑完翻译直接返回"将要发出的请求"——**不提交、不占号**。"""
+        headers = self.client.headers("<token>", referer=f"{self.settings.base_url}/c/<chat_id>")
+        headers["Cookie"] = "token=<redacted>"
+        return {
+            "dry_run": True,
+            "upstream": {
+                "method": "POST",
+                "url": f"{self.settings.base_url}/api/v2/chat/completions?chat_id=<chat_id>",
+                "headers": headers,
+                "body": self.client.build_chat_submit_body(
+                    "<chat_id>", model=req.model, prompt=req.prompt,
+                    files=req.files or None),
+            },
+            "degradations": req.degradations,
+        }
+
+    def chat_stream(self, req: ChatRequest, meta: dict | None = None) -> Iterator[str]:
+        """chat（t2t）→ 上游增量文本流。
+
+        · 每次请求**新建上游会话**（无状态；OpenAI 客户端自带完整历史）；
+        · 失败回报沿用视频门的分类；**QuotaExhausted 例外**：chat 不消耗视频额度，
+          按"refused"短冷（60s）而不是把账号冷到 UTC 日界（那是视频额度语义）；
+        · 取号走 `acquire_chat_with_wait`（不看视频额度）；等不到 ⇒ 429 背压
+          （chat 是同步链路，没有任务表可排队）；
+        · **附件上传链**（2026-09-24）：file/audio/video/data: 图 附件在拿到账号 token 后
+          「解析来源 → getstsToken → OSS V1 PUT → files[] 条目」再提交（UPSTREAM §4.7）；
+        · `meta`：可选的回传口袋 —— 上游流里的 `usage`（真实值，最后一份）写在
+          `meta["usage"]`，由路由层透传（见 `openai_chat.openai_usage`）。
+        """
+        account = self.pool.acquire_chat_with_wait()
+        email = account.email
+        extra = self._extra_cookies(email)
+
+        try:
+            def attempt(token: str) -> Iterator[str]:
+                files = list(req.files)
+                if req.attachment:
+                    kind, source = req.attachment
+                    data, filename, ctype = self._resolve(
+                        kind, source, max_bytes=self.settings.upload_max_bytes,
+                        param="messages")
+                    entry = self.client.upload_attachment(
+                        token, kind=kind, filename=filename, content_type=ctype,
+                        data=data, extra_cookies=extra)
+                    files.append(entry)
+                chat_id = self.client.new_chat(token, chat_type="t2t", model=req.model,
+                                               extra_cookies=extra)
+                body = self.client.build_chat_submit_body(chat_id, model=req.model,
+                                                          prompt=req.prompt,
+                                                          files=files or None)
+                stream = self.client.stream_chat(token, chat_id, body, extra_cookies=extra,
+                                                 meta=meta)
+                self.pool.report_chat_submitted(email)
+                return stream
+
+            yield from self._authed_call(email, attempt)
+        except AdapterError as exc:
+            if isinstance(exc, QuotaExhaustedError):
+                self.pool.report_failure(email, "refused")
+            else:
+                self._report_submit_failure(email, exc)
+            raise
 
     # ------------------------------------------------------------------ 查询
 

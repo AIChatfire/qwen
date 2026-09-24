@@ -323,6 +323,47 @@ class AccountPool:
         reason = "全部账号在冷却中或今日额度已用尽（3 次/天/账号，UTC 日重置）"
         raise RateLimitedError(reason, retry_after=min(last_hint, 3600.0))
 
+    # ---------------------------------------------------------------- 取号：chat 门
+
+    def acquire_chat(self) -> tuple[AccountState | None, float]:
+        """chat（t2t）取号：**不看视频额度**（chat 不消耗 3 次/天的视频池），
+        但仍受冷却与同账号提交节奏约束（写端点的突发纪律对 t2t 同样适用）。"""
+        now = self._now()
+        with self._lock:
+            candidates = [a for a in self._accounts.values() if a.cooldown_until <= now]
+            if not candidates:
+                soonest = min((a.cooldown_until for a in self._accounts.values()), default=now)
+                return None, max(0.0, soonest - now)
+
+            def ready_at(a: AccountState) -> float:
+                return a.last_submit_at + self.settings.submit_min_interval
+
+            ready = [a for a in candidates if ready_at(a) <= now]
+            if ready:
+                return min(ready, key=lambda a: a.last_submit_at), 0.0
+            earliest = min(candidates, key=ready_at)
+            return earliest, max(0.0, ready_at(earliest) - now)
+
+    def acquire_chat_with_wait(self) -> AccountState:
+        """chat 门的等待版：等不到 ⇒ 429（chat 是同步链路，**没有任务表可排队**）。"""
+        if not self._accounts:
+            raise CredentialUnavailableError(
+                "未配置任何账号（QWEN_ACCOUNTS）—— 部署问题，不是调用方的错")
+        deadline = self._now() + self.settings.account_wait_timeout
+        last_hint = 1.0
+        while True:
+            account, wait = self.acquire_chat()
+            if account is not None and wait <= 0:
+                return account
+            hint = wait if account is not None else max(wait, 1.0)
+            last_hint = hint
+            if self._now() + hint > deadline:
+                break
+            time.sleep(min(hint, 1.0))
+        raise RateLimitedError(
+            "无可用账号（全部冷却中或同账号提交间隔未到）—— chat 请求未提交",
+            retry_after=min(last_hint, 3600.0))
+
     # ------------------------------------------------------------------ 回报
 
     def report_submitted(self, email: str) -> None:
@@ -339,6 +380,15 @@ class AccountPool:
             account.last_submit_at = now
             account.inflight += 1
         self._notify()
+
+    def report_chat_submitted(self, email: str) -> None:
+        """chat 提交回执：**只更新节奏戳** —— 不动视频额度计数（day_used）、不动 inflight
+        （chat 没有完成回报路径，动 inflight 必泄漏）。节奏戳不进持久层 ⇒ 不 notify。"""
+        now = self._now()
+        with self._lock:
+            account = self._accounts.get(email)
+            if account is not None:
+                account.last_submit_at = now
 
     def report_finished(self, email: str) -> None:
         with self._lock:

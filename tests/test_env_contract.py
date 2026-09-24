@@ -52,6 +52,14 @@ KEY_TO_FIELD: dict[str, str | None] = {
     "QUEUE_RETRY_BASE": "queue_retry_base",
     "API_KEYS": "api_keys",
     "KEY_SECRET": "key_secret",
+    "MODELS_CACHE_TTL": "models_cache_ttl",
+    "ARK_FALLBACK_BASE": "ark_fallback_base",
+    "ARK_FALLBACK_KEY": "ark_fallback_key",
+    "ARK_FALLBACK_MODEL": "ark_fallback_model",
+    "ARK_FALLBACK_MODELS": "ark_fallback_models",
+    "ARK_FALLBACK_TIMEOUT": "ark_fallback_timeout",
+    "QWEN_UPLOAD_ENABLED": "upload_enabled",
+    "QWEN_UPLOAD_MAX_BYTES": "upload_max_bytes",
     "TASK_DB": "task_db",
     "DATA_DIR": "data_dir",
     "TASK_TIMEOUT": "task_timeout",
@@ -77,6 +85,7 @@ ACTIVE_VALUE_DIFFS: dict[str, str] = {
 ILLUSTRATIVE_COMMENTED: dict[str, str] = {
     "TASK_DB": "注释里是 PostgreSQL 示例 DSN；代码默认空 ⇒ sqlite:///<DATA_DIR>/qwen.db",
     "QWEN_TOKEN_URL": "注释里是外部 token 服务示例地址；代码默认空 ⇒ 走 signin 铸造",
+    "ARK_FALLBACK_MODELS": "注释里是备用模型链示例（逗号分隔）；代码默认空列表 ⇒ 无备用链",
 }
 
 

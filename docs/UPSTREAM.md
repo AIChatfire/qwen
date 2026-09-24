@@ -1,4 +1,4 @@
-# Qwen 网页端视频生成上游契约（t2v / i2v）
+# Qwen 网页端上游契约（视频 t2v / i2v + 文本对话 t2t）
 
 > 本文件是本仓**上游侧的唯一真源**：`app/upstream/qwen/*` 里凡与上游形态相关的判读，
 > 都能在这里找到依据与证据等级。
@@ -18,8 +18,10 @@
 
 ```
 POST /api/v2/chats/new                        → data.id（chat_id；可长期复用）
-POST /api/v2/chat/completions?chat_id=<id>    → data.messages[0].extra.wanx.task_id（同步返回）
-GET  /api/v2/task/status/<task_id>            → data.task_status / data.content（产物 URL）
+POST /api/v2/chat/completions?chat_id=<id>    → 视频：data.messages[0].extra.wanx.task_id（同步返回）
+                                                文本：SSE 增量流（stream:true，形态见 §4.5）
+GET  /api/v2/task/status/<task_id>            → data.task_status / data.content（视频产物 URL）
+GET  /api/models                              → 模型清单（免鉴权，✅ 2026-09-24 实测）
 ```
 
 - **创建是两段式**：`completions` 的 `chat_id` 必须是**已存在**的会话（瞎填 UUID ⇒ `CHAT_NOT_FOUND`）。
@@ -33,8 +35,9 @@ GET  /api/v2/task/status/<task_id>            → data.task_status / data.conten
 |---|---|---|---|
 | `POST` | `/api/v2/auths/signin` | 登录取 token（`Set-Cookie: token=…`） | ✅ |
 | `POST` | `/api/v2/chats/new` | 建会话，返回 `data.id` | ✅ |
-| `POST` | `/api/v2/chat/completions?chat_id=<id>` | 提交生成（`chat_type` 三处同标） | ✅ |
+| `POST` | `/api/v2/chat/completions?chat_id=<id>` | 提交生成（`chat_type` 三处同标；t2t 即文本对话/多模态解析） | ✅ |
 | `GET` | `/api/v2/task/status/<task_id>` | 查询任务 | ✅ |
+| `GET` | `/api/models` | 模型清单（**免鉴权**：无任何 cookie 即 200） | ✅（2026-09-24 实测） |
 | — | 无取消端点 | 脚本/适配层不声明取消能力（未终态 DELETE 由本服务拒绝） | ✅（证据是"不存在"） |
 | `POST` | `/api/v2/users/user/entitlement_quota` | 额度查询（只读） | ✅（`times_left` 有滞后，见 §3） |
 
@@ -49,6 +52,7 @@ GET  /api/v2/task/status/<task_id>            → data.task_status / data.conten
 
 ✅ **2026-09-22 再证（视频写端点）**：本服务用同一份最小凭据（`Cookie: token=<JWT>`，无 bx-*、
 无其他 cookie）真实跑通 **t2v 与 i2v** 两条链路（见 §7.1）—— U-7 由此关闭。
+✅ **2026-09-24 三证（t2t 写端点）**：同一头集跑通文本对话与图片解析（§4.5），零 RGV587。
 
 - token 是**无状态 JWT**（实测：`token_len=209`；签发后 27 分钟仍被接受）。
   **载荷只有三个键：`{exp, id, last_password_change}`（没有 `iat`）**，`id` 即账号 id，
@@ -84,7 +88,7 @@ Cookie: token=<JWT>
 ```
 
 ✅ 2026-09-22 实测：该头集（不含 `bx-*`）连续完成 signin / chats/new / completions / task/status
-全部 200，**零 RGV587**。
+全部 200，**零 RGV587**。✅ 2026-09-24 在 t2t 写端点复证（文本 + 图片解析）。
 
 ### 2.3 `version: 0.2.0` 是写端点的硬门槛
 
@@ -102,6 +106,8 @@ Cookie: token=<JWT>
 
 ⇒ 本仓纪律：**见到 RGV587，第一步把请求头与本文件 §2.2 逐字段对齐**，再谈限速/换号。
 处置上仍按 429 + `Retry-After` 退避（不自动重试，避免加深标记）。
+（⚠️ 2026-09-24 又踩一次同款坑：探针只带 Cookie 打 `chats/new` ⇒ 非 JSON 响应；
+换完整头即正常 —— 探针一律复用 `QwenClient.headers()`。）
 
 ### 2.5 出口拓扑：哪个请求走哪个 IP（2026-09-22 代码核对 + 实测）
 
@@ -176,10 +182,13 @@ Cookie: token=<JWT>
 | `times_left` | **有滞后/缓存，不是实时计数** ⇒ 只当参考，熔断以本仓账号池的计数为准 | ✅（09-22 复证：成功出片后 5 分钟与 10 分钟两次读 `t2v` 仍为 `3`；`t2i` 同为 `3`） |
 | 风控拦截时 | **不扣额度**（实测：被 RGV587 拦后 `t2v.times_left` 仍为 3） | ✅ |
 | "提交即扣 vs 成功才扣" | ⚠️ 未证实 | — |
+| **t2t（文本对话/解析）** | **不在视频额度池内**（chat 门不计数、不受 3 次/天约束；当日 7 连发真实写请求零频控/零风控） | ✅（09-24 实测；⚠️ 上游对 t2t 的正式频控形态仍未观测到，见 U-14） |
 
 ---
 
 ## 4. 创建请求体（实测形态）
+
+### 4.1 视频（t2v / i2v）
 
 ```jsonc
 {
@@ -203,7 +212,7 @@ Cookie: token=<JWT>
 }
 ```
 
-### 4.1 t2v / i2v 判定：三处必须同时标
+### 4.1.1 t2v / i2v 判定：三处必须同时标
 
 | 位置 | t2v | i2v |
 |---|---|---|
@@ -214,7 +223,7 @@ Cookie: token=<JWT>
 `size` 出现在**两处**（顶层与 `extra.meta.size`），必须同值。比例枚举（UI 截图确认）：
 `1:1` / `3:4` / `4:3` / `16:9` / `9:16`；**上游只吃这 5 个**。
 
-### 4.2 `files[0]`（仅 i2v —— 形状依据 2026-09-22 用户抓包）
+### 4.2 `files[0]`（仅 i2v —— 形状依据 2026-09-22 用户抓包；✅ t2t 图片解析复用同款形状，§4.5）
 
 ```jsonc
 {"type": "image", "name": "example.png", "file_type": "image/png",
@@ -225,19 +234,123 @@ Cookie: token=<JWT>
 - 🔴 **上游的 i2v 是"引用"而非"上传"**：抓包里 `url` 指向上游已有资源。
   ✅ **2026-09-22 实测**：用户抓包里的样例图（`qwen-chat.oss-ap-southeast-1.aliyuncs.com/
   resources/i2v/…png`）作首帧，经本服务**真实出片**（§7.1 i2v 行）。
+  ✅ **2026-09-24 再证（t2t 图片解析）**：同一形状放进 t2t 的 `files`，上游**真实看图作答**（§4.5）。
 - ⚠️ **第三方域名的外链图仍未验证** ⇒ 本服务照发 + 降级告警（`app/media.py::host_warning`）。
 - 自有图正解（已端到端验证过出片）：`POST /api/v2/files/getstsToken` → OSS V4 PUT → 得 `file_url`
   （⚠️ 签名仅 **300s**，缓存/排队会静默失效）。本仓 v1 **不实现上传链路**，`data:` URI 明确 400。
 - 早期抓包版本里曾有 `isQuote: true` 等字段；2026-09-22 抓包**没有**这些键 ⇒ 本仓按**最小集**发。
 
-### 4.3 不接受的字段
+### 4.3 不接受的字段（视频）
 
 `duration` / `resolution` / `seed` / `watermark` / `camera_fixed` / `generate_audio` / `frames`
 **在上游请求体里不存在**（发了也无效，且可能触发校验拒绝）—— 见 §8。
 
+### 4.4 t2t（文本对话/多模态解析）提交体 —— 逐字对齐 2026-09-24 用户抓包 + 当日实测证词
+
+```jsonc
+{
+  "stream": true, "version": "2.1", "incremental_output": true,
+  "chatId": "<chat_id>", "chat_id": "<chat_id>",     // 🔴 双写都要：缺小写 chat_id ⇒ 400
+  "parentId": "", "parent_id": null, "chat_mode": "normal",
+  "model": "qwen3.7-plus",
+  "messages": [{
+    "id": null,                                       // 抓包与实测一致：null（不是 UUID）
+    "fid": "<uuid>", "parentId": null, "childrenIds": ["<uuid>"],
+    "role": "user", "content": "<prompt>", "user_action": "chat",
+    "files": [],                                      // 恒在：纯文本为 []；图片解析放 §4.2 条目
+    "timestamp": <epoch 秒>, "models": ["qwen3.7-plus"], "model": "",
+    "chat_type": "t2t",
+    "feature_config": {"thinking_enabled": true, "output_schema": "phase",
+                       "research_mode": "normal", "auto_thinking": true,
+                       "thinking_mode": "Thinking", "thinking_format": "summary",
+                       "auto_search": true},
+    "extra": {"meta": {"subChatType": "t2t"}},
+    "sub_chat_type": "t2t", "parent_id": null
+  }],
+  "timestamp": <epoch 秒>
+}
+```
+
+与视频体（§4.1）的**实证差异**（各按各的抄，别"顺手统一"）：
+
+| 维度 | 视频（t2v/i2v，09-22 抓包） | 文本（t2t，09-24 抓包+实测） |
+|---|---|---|
+| `stream` | `false`（同步拿 `wanx.task_id`） | `true`（流式增量） |
+| `size` | 顶层 + `extra.meta` 两处 | **完全没有** |
+| `feature_config` | thinking 关、`thinking_mode=Fast`、无 `thinking_format` | thinking 开、`thinking_mode=Thinking`、`thinking_format=summary` |
+
+与视频体**相同**的（09-24 实测证词，别猜）：
+
+| 维度 | 证词 |
+|---|---|
+| 顶层 `chatId` + 小写 `chat_id` **双写** | 🔴 缺小写 `chat_id` ⇒ HTTP 200/actual 400 + `RequestValidationError: Field 'chat_id': Field required`（经本服务真实一发踩中并修正） |
+| `messages[0].id` = `null` | 抓包原样 |
+| `messages[0].files` 恒在 | 纯文本 `[]`；图片解析放 §4.2 条目 |
+
+### 4.5 t2t 响应形态（✅ 2026-09-24 单发探针实测，U-12 关闭）与多模态矩阵
+
+**SSE 事件流**（`content-type: text/event-stream`，探针原文落档 `var/probe/20260924_030839_text/`）：
+
+```jsonc
+data: {"response.created":{"chat_id":"…","parent_id":"…","response_id":"…","response_index":"0"}}
+data: {"choices":[{"delta":{"role":"assistant","content":"","phase":"thinking_summary",
+       "extra":{"summary_title":{"content":[…]},"summary_thought":{"content":[…]}}}}]}
+data: {"choices":[{"delta":{"role":"assistant","content":"","phase":"thinking_summary","status":"finished"}}], …}
+data: {"choices":[{"delta":{"role":"assistant","content":"你好","phase":"answer","status":"typing"}}],
+       "response_id":"…","usage":{"input_tokens":2421,"output_tokens":95,"characters":0,"total_tokens":2516,…}}
+data: {"choices":[{"delta":{"content":"","role":"assistant","status":"finished","phase":"answer"}}],"response_id":"…"}
+```
+
+判读（实现见 `client.py::stream_chat` / `extract_stream_*`）：
+
+| 维度 | 实测结论 |
+|---|---|
+| 正文增量 | `choices[0].delta.content`（`phase:"answer"`）—— 逐段推进 |
+| thinking | `phase:"thinking_summary"` 事件的 `content` **恒为空串**（摘要正文在 `extra.summary_title/summary_thought`，v1 不透传）；其结束事件**也带 `status:"finished"`** ⇒ 🔴 结束判据必须 `status=="finished"` **且 `phase=="answer"`**（判宽了会在思考阶段掐断整条流） |
+| usage | **真实存在**：`input_tokens` / `output_tokens` / `total_tokens`（+ `input_tokens_details` 等），随 answer 事件出现且 **output 逐事件递增** ⇒ 最后一份即终值（OpenAI 映射：prompt/completion/total） |
+| 结束 | `status:"finished"`（`phase:"answer"`）后流自然结束；**没有 `data: [DONE]`**（解析器容忍网关注入的 DONE） |
+| 流内错误 | 🔴 **HTTP 200 包错误事件**：`data: {"error":"Internal error!"}`（外链 PDF 实测）与 `data: {"error":{"code":"invalid_input","details":"输入或附件无效。请检查后重试。"}}`（外链音频/视频实测）⇒ 解析器必须识别并响亮失败 |
+
+**多模态（files[]）× 判决矩阵**（每格一发，单发即停，探针 `scripts/probe_chat_parse.py`）：
+
+| 附件 | files 条目 | 判决 |
+|---|---|---|
+| 图片（**上游域内** URL） | §4.2 形状（`file_class:"vision"`），`chat_type` 保持 `t2t` | ✅ **真实看图作答**（潜水员样例图，描述准确；usage input=1826） |
+| 文档（外链 PDF） | 同构推测（`type/file_class:"document"`） | 🔴 `{"error":"Internal error!"}`（HTTP 200 流内） |
+| 音频（外链 wav） | 同构推测（`"audio"`） | 🔴 `invalid_input`「输入或附件无效」 |
+| 视频（外链 mp4） | 同构推测（`"video"`） | 🔴 `invalid_input`（同上） |
+
+> 文档/音频/视频解析的**正解**是上游 OSS 上传链路（`getstsToken` → OSS PUT → `file_url`）——
+> 但"外链 URL + 推测形状被拒"与"必须上传"之间的因果**未拆分**（也可能是形状不对）；
+> 要定论需先实现上传链路再对照。登记为 **U-15**。
+
+### 4.6 工具调用（tools）× 判决（✅ 2026-09-24 三发对照实测，U-16）
+
+| 实验 | 请求 | 结果 |
+|---|---|---|
+| ① tools + 内置搜索开 | OpenAI `tools`（`get_weather`）+ `tool_choice:"auto"` + 抓包原样 feature_config（`auto_search:true`） | `get_weather` **零出现**；模型改用**内置 `web_search`** 自答（真实天气，18.6s 服务端闭环） |
+| ② tools + 内置搜索关 | 同上 + `feature_config.auto_search:false` | `function_call` **零出现**；模型正文自述"无法使用指定工具"，改用其他方式作答 |
+
+**判决**：上游 `chat/completions` **不支持 OpenAI 风格的客户端函数调用** —— `tools`/`tool_choice`
+被**静默忽略**（不报错、不产生 `tool_calls`、连错误事件都没有）。**别再试"透传 tools 给上游"这条路。**
+
+但上游有**内置服务端工具**（`feature_config.auto_search` 触发的 `web_search` 等；MCP 生态见
+`GET /api/models` 的 `info.meta.mcp`：image-generation / code-interpreter / amap / fire-crawl），
+**服务端闭环**——模型自己调用、自己执行、自己消费结果，SSE 有结构化事件：
+
+```jsonc
+data: {"choices":[{"delta":{"role":"assistant","content":"","phase":"web_search","status":"typing",
+       "function_call":{"name":"web_search","arguments":"{\"queries\": …"},
+       "function_id":"call_244e3bb85b3043eb83e21348","extra":{"display_position":"think"}}}]}
+```
+
+判读：`phase:"web_search"` 事件的 `content` 恒空 ⇒ 适配层只提取 content 就**天然不受工具事件污染**；
+最终 `answer` 是工具结果的总结（回答含真实天气数据）。探针原文：
+`var/probe/20260924_034322_tools/`、`var/probe/20260924_034525_tools_no_search/`。
+
 ---
 
-## 5. 创建响应（`stream:false` ⇒ 同步返回 task_id）
+## 5. 创建响应（视频，`stream:false` ⇒ 同步返回 task_id）
 
 ```json
 {"success": true, "request_id": "…",
@@ -293,6 +406,7 @@ Cookie: token=<JWT>
 
 **出片耗时实测波动大**：约 93s ～ 343s（同一天内：i2v 93s / t2v 343s；09-17 记录为 105s）
 ⇒ **不要用固定耗时做超时假设**；本服务默认 900s 留足余量。
+（t2t 实测 5.8s ～ 22.7s 出全量回复，量级完全不同 —— chat 门是同步链路，不落任务表。）
 
 ---
 
@@ -317,6 +431,15 @@ Cookie: token=<JWT>
   ⇒ 两次生成落在两个不同账号，各消耗 1/3 日额度。
 - 全链路零 RGV587、零告警；signin → `chats/new` → `completions` → `task/status` 全部 200。
 
+### 7.2 chat 门真实一发实录（2026-09-24，经本服务 + 直连探针）
+
+| 请求 | 结果 |
+|---|---|
+| t2t 非流式「用一句话介绍你自己」 | ✅ HTTP 200，58 字，22.7s（首次因缺顶层 `chat_id` 被 400，修正后通过 —— 证词进 §4.4） |
+| t2t 流式「只回答两个字：你好」 | ✅ SSE 全量提取成功（宽容解析器首选路径命中） |
+| 图片解析（上游域内样例图）经服务 | ✅ 准确描述潜水员/沉船场景；usage 1826/678/2504 透传 |
+| 文档/音频/视频解析（外链） | 🔴 流内错误事件（见 §4.5 矩阵 → U-15） |
+
 ---
 
 ## 8. 与目标契约（方舟 Seedance）的差异核对
@@ -334,7 +457,7 @@ Cookie: token=<JWT>
 | D-11 | 查询无参数（凭证即身份） | **查询带路径参数** | 任务归属校验落在本层（`credential_id` 指纹；不符本地 404） |
 | D-12 | 回调 | 上游无 webhook | 本服务 v1 不实现回调（`callback_url` 进 `degradations`） |
 | D-13 | `execution_expires_after` | 无 | 由本服务 `TASK_TIMEOUT` 兜 |
-| D-14 | `model` = provider/model | **上游没有"视频模型名"**：能力由 `chat_type` 决定 | `model` 段只做 provider 校验（必须 `qwen`），**不转发**；聊天模型由配置 `QWEN_CHAT_MODEL` 指定 |
+| D-14 | `model` = provider/model | **上游没有"视频模型名"**：能力由 `chat_type` 决定 | 视频门：`model` 段只做 provider 校验（必须 `qwen`），**不转发**；chat 门：模型名**转发上游**（`messages[0].models` 与顶层 `model`），清单注册自 `GET /api/models` |
 
 ---
 
@@ -342,9 +465,9 @@ Cookie: token=<JWT>
 
 | # | 项 | 状态 | 说明 |
 |---|---|---|---|
-| U-1 | 外链图作 i2v 首帧 | 🟡 **部分关闭**（2026-09-22） | **上游域内图（OSS `resources/i2v/…`）✅ 实测出片**；**第三方域名外链仍未验证**（本服务照发 + 告警） |
+| U-1 | 外链图作 i2v 首帧 | 🟡 **部分关闭**（2026-09-22） | **上游域内图（OSS `resources/i2v/…`）✅ 实测出片**；**第三方域名外链仍未验证**（本服务照发 + 告警）。t2t 图片解析同口径（§4.5） |
 | U-2 | `task_status` 的失败值形态（`failed`？`failure`？） | ⚠️ 未证实 | 需观测一个真实失败任务 |
-| U-3 | `bx-*` 是否任何情况都不必需 | ⚠️ 未证实（当前不发送、连续成功） | 上游收紧时需补 |
+| U-3 | `bx-*` 是否任何情况都不必需 | ⚠️ 未证实（当前不发送、连续成功） | 上游收紧时需补。t2t 写端点同样未带 bx-*（09-24 已复证可用） |
 | U-4 | 额度耗尽的**真实错误形态**（视频档） | ⚠️ 未证实 | 打满一个账号的 3 次后观察 |
 | U-5 | 产物 URL 的**有效期** | ⚠️ 未证实 | 定时 ping 一个产物 URL |
 | U-6 | 额度是"提交即扣"还是"成功才扣" | ⚠️ 未证实 | 对照实验：提交后立刻查额度 |
@@ -353,6 +476,37 @@ Cookie: token=<JWT>
 | U-9 | **guest（匿名访客身份）能否提交视频任务** | ✅ **关闭（2026-09-22）：不支持** | 单发实测：免费段 `chats/new`（`chat_mode=guest` + `chat_type=t2v`）→ **200 受理**；真实一发 t2v 提交 → **`x-actual-status-code: 400` + `code=internal_error`**（无 task_id、未扣额度）。既非额度拒绝（会回 `RateLimited`+额度文案）也非凭据问题（会 401/RGV587）⇒ **guest 门接受会话但拒绝视频生成**。过程见 §9.2 |
 | U-10 | **token 的"真实"失效时点** | ⚠️ **未证实**（2026-09-22 登记） | JWT 自称 `exp` = 铸后 **30 天**，但**用户经验是"可能 7 天就失效"**（服务端可提前失效）⇒ 本仓按 **6 天**主动续期（预留 1 天）+ 401 当场重铸兜底。要定论需**长跑打点**：同一 token 定时发只读请求，记录首次 401 的时点（≥7 天） |
 | U-11 | **`task_id` 随机段的熵够不够**（免 Key 读的安全前提） | ⚠️ **待收口**（2026-09-22 登记） | 2026-09-22 起 `GET /tasks/{id}` **不强制 Key**（`id` 即凭据，同 `../jimeng`）。前提是 id **不可猜**：jimeng 用 128 bit 随机，而本仓沿用方舟格式 `cgt-<UTC 秒>-<5 位随机>` ≈ **29.8 bit**（36^5≈6.05e7/秒窗）⇒ **待办：随机段加长到 ≥16 位**（客户把 id 当不透明串用，加长不破坏契约）。当前部署只绑回环，**暂无暴露面** |
+| U-12 | **上游 t2t 的流式响应事件形态** | ✅ **关闭（2026-09-24）** | 单发探针拿全原始 SSE（§4.5）：正文在 `delta.content`（`phase:"answer"`）、thinking 摘要 content 恒空、**结束判据 = `status:"finished"` ∧ `phase:"answer"`**（thinking 的 finished 也带 status —— 判宽即截断，实测踩中）、无 `[DONE]`、流内 error 事件两种形态、usage 真实存在且递增 |
+| U-13 | **`chats/new` 的 `chat_type`/`models` 参数对 t2t 会话的影响** | ✅ **关闭（2026-09-24）** | `chats/new(chat_type="t2t", models=[模型])` + `chat_id` 双写提交体，真实一发成功（§7.2）；🔴 **缺小写 `chat_id` ⇒ 400 `Field 'chat_id': Field required`**（唯一踩中的坑，证词进 §4.4） |
+| U-14 | **上游对 t2t 的频控/风控形态** | ⚠️ 未证实（2026-09-24 登记） | 当日 7 连发真实写请求（文本×3 + 图片×2 + 音频/视频探针）**零频控、零风控、零额度计数**；正式频控形态仍需长跑观测。chat 门仍守同账号提交间隔（写端点突发纪律） |
+| U-15 | **文档/音频/视频解析（files 附件）** | ✅ **关闭（2026-09-24 晚）：上传链打通，三类全通** | 根因确证：**必须走上游 OSS 上传链**（外链 URL 任何形状都被拒）。上传链 = `getstsToken{"file_name","file_size","file_type"}` → 预签名 URL **不可用**（SignatureDoesNotMatch，7 种头组合全败）→ **改用 STS 凭证自签 OSS V1**（HMAC-SHA1，`x-oss-security-token` 头）PUT 成功。files 条目形状：文档 `type/file_class:"file"`、音频 `"audio"`、视频 `"video"`（§4.7）。经服务实测：PDF 答出标题（Attention Is All You Need）、音频听出蜂鸣声、视频描述出森林洞穴场景 |
+| U-16 | **OpenAI 风格客户端函数调用（`tools`/`tool_choice`）** | ✅ **关闭（2026-09-24）：不支持** | 三发对照（§4.6）：带 tools 被**静默忽略**（`get_weather` 零痕迹）；关内置搜索后模型自述"无法使用指定工具"（`function_call` 零出现）。**内置服务端工具**（`auto_search` 的 `web_search` 等）不受影响、照常闭环（SSE 有 `phase:"web_search"` + `function_call` 结构化事件，content 恒空）。chat 门对 `tools`/`tool_choice` 忽略 + 降级说明（行为与上游一致，文档登记证据） |
+| U-17 | **t2t 最大上下文（实测边界）** | 🟡 **部分关闭（2026-09-24）** | 上游自报 `max_context_length=1,000,000` tokens，但经网页端接口实测：**≈5 万汉字（usage 39,668 prompt tokens）可靠工作**（首尾密钥双命中，无截断）；**≥6.2 万汉字触发 x5sec 风控**（秒拒、90s 冷却重试无效）。🔴 **换出口/轮换代理不可绕过**（两个全新 IP 同样秒拒 —— WAF 请求体大小规则，与 §2.4"与出口无关"结论一致）。比率实测 ≈1.3 字/token（usage 口径），上游每请求固定注入 ~1.4-2.8K tokens。实用建议：单次 prompt ≤5 万汉字；更长走分段或方舟回退通道（Doubao 256K 未实测） |
+
+### 4.7 附件上传链（✅ 2026-09-24 晚实测，U-15 关闭）
+
+```
+POST /api/v2/files/getstsToken   body: {"file_name", "file_size", "file_type"}
+                                 → data{access_key_id, access_key_secret, security_token,
+                                        bucketname, endpoint, file_path, file_url(预签名), file_id, region}
+PUT  https://{bucket}.{endpoint}/{file_path}   ← OSS V1 签名（Authorization: OSS ak:sig）
+```
+
+实测要点（实现 `app/upstream/qwen/upload.py`）：
+- 🔴 **`file_type` 必填**：缺失 ⇒ `Bad_Request "Invalid file information!"`；
+- 🔴 **预签名 `file_url` 不可用**：直接 PUT 一律 `SignatureDoesNotMatch`（VH/path × 7 种头组合全败，
+  含浏览器头）——用响应里的 **STS 凭证自签 OSS V1**（StringToSign = `PUT\n\n{ct}\n{date}\n
+  x-oss-security-token:{tok}\n/{bucket}/{path}`，HMAC-SHA1）即 200；
+- PUT 的 **Content-Type 必须与 getstsToken 一致**（签名含 content-type）；
+- `file_url` 签名仅 **300s** ⇒ 上传后立即用规范 URL（无签名）进 `files[]`，勿缓存；
+- files 条目形状（type 与 file_class 同值）：图片 `image/vision`（§4.2）、文档 **`file/file`**、
+  音频 `audio/audio`、视频 `video/video` —— 逐类实测。
+
+| 附件 | 实测结果（经本服务） |
+|---|---|
+| PDF 2.2MB（arxiv attention） | ✅ 模型答出标题 **"Attention Is All You Need"** |
+| wav 1.5s（440Hz 蜂鸣） | ✅ "持续的电子蜂鸣声，像警报或提示音" |
+| mp4 0.99MB（Big Buck Bunny） | ✅ "阳光明媚的森林中，大树下长满青草的洞穴入口" |
 
 ### 9.1 guest 通路的事实边界（2026-09-22 盘点，来源：既有取证，非新实验）
 
@@ -388,7 +542,8 @@ Cookie: token=<JWT>
 **边界与注意**：
 - 🔴 这不是"额度不够"：额度拒绝的形态是 `code=RateLimited` + 「今日…额度已用完」文案（`qwen-chat-api.md` §2.12）；
   也不是"参数写错"：缺 `version` 头的形态是 `Bad_Request`（`qwen-async-task-api.md` §7.3），而本次该头已带。
-  `internal_error` 是上游在"这条路走不通"时给的**无信息量错误码**（同类已知用法：`3.0-pro` 传超大 `size` 也回它）。
+  `internal_error` 是上游在"这条路走不通"时给的**无信息量错误码**（同类已知用法：`3.0-pro` 传超大 `size` 也回它；
+  09-24 外链 PDF 也是它）。
 - **未扣额度**：无 task_id、无产物，`t2v` 计数不变；单发即停（遵守 `R-2`：写端点勿连打）。
 - ⚠️ **未验证（不得推断）**：**图片侧的 guest 通路今天是否仍可用**。历史实证是 09-18/19（矩阵 5/5、批量出图工具），
   而本次 ① 显示访客 UI 已被重定向到登录页 ⇒ 存在"guest 通路整体收紧"的可能。
@@ -411,3 +566,8 @@ Cookie: token=<JWT>
 | 2026-09-22 | 补 **§2.6 鉴权形态 × 视频矩阵**（一手实测，4×2 格）：`cookie` ✅ 出片（含归属/产物/凭据三道自证）、`bearer` 🔴 RGV587、`guest` 🔴 `internal_error`、`anon` 🔴 `401`；**结论：不登录（含访客身份）都出不了视频**。同时固化"**免费段不能当鉴权判据**"（三形态在 `chats/new` 全 200，差异只在写端点）。新增探针 `scripts/probe_auth_forms_video.py`（两段式、单号冷却、命中风控即停账号写）。§3 的 `times_left` 行补 09-22 复证 |
 | 2026-09-22 | **token 续期两层落地 + 铸造出口改 HTTP**（用户决策）：① 主动续期 `min(exp − 提前量, 铸后 QWEN_TOKEN_TTL)`，**默认 6 天**（给"疑似 7 天失效"预留 1 天；`<=0` 归一 6 天，**不提供关掉上限的开关**）；② 被动兜底 = 401 ⇒ 清缓存 → 立即重铸 → **原请求重试一次**（写端点也重试：未受理、不重复计费）。`mint_token` **删除 SOCKS 分支**（不做兼容，少 ~130 行自研 socket/TLS/HTTP 解析），改用 `QWEN_SIGNIN_PROXY`（HTTP 代理）；实测池语义：**每连接换 IP + 同连接复用同 IP** ⇒ 每次铸造换 IP、一次铸造全程一个 IP（顺带修掉旧实现"一次铸造两条连接可能换 IP"的瑕疵）。新增 `tests/test_signin.py` + 续期用例 ⇒ 当轮全量 **115 项**。**登记 U-10**（token 真实失效时点，未证实） |
 | 2026-09-22 | **env 三向一致落地**（用户：「同步 env」）：`.env.example` 重建为**全量登记**（37 键，含每个键的代码默认与坑），修正两处**已过期**注释（TTL 还写着"默认 1 天 / 0=不设上限"、出口还写着"两种都收"），补登 3 个此前完全没登记的键（`POLL_INTERVAL` / `WORKERS` / `GUNICORN_TIMEOUT`）；`.env` 按模板结构重建（8 显式 + 29 注释态，600 保留）并写下**机器可核的刻意差异清单**。新增门禁：模板侧 `tests/test_env_contract.py`（6 项，含"注释态值必须等于代码默认"与"差异登记不得过期"），生效文件侧 `scripts/env_sync_check.py`（`.env` 不入库 ⇒ 不能写成会跳过的测试）。全量 **128 项** |
+| 2026-09-24 | **chat（t2t）门落地**（用户：「chat 任务 适配 openai」「注册v1/models」「只做chat任务」）：① 登记 **§4.4 t2t 提交体**（当日用户抓包逐字：`stream:true`、无 `size`、thinking 开含 `thinking_format`）；② 实测 **`GET /api/models` 免鉴权**（无任何 cookie 即 200）并注册进 `/v1/models`（TTL 缓存 + 失败回退）；③ **零真实生成请求**（适配纪律），chat 门以 dry-run + 假上游全链路测试覆盖。⚠️ 新增未证实：U-12 / U-13 / U-14。env +1 键（`MODELS_CACHE_TTL`，模板 38 键） |
+| 2026-09-24 | **chat 门真实一发 + 多模态取证扩口**（用户：「测试 另外还有图片解析 文件解析 视频解析 音频解析」）：① **t2t 非流式 + 流式经服务真实成功**（22.7s / 5.8s），**U-12 ✅ 关闭**（§4.5 原始 SSE 形态：正文 `delta.content`、thinking 摘要 content 恒空、**结束判据必须 `status ∧ phase:"answer"`**——thinking 的 finished 也带 status，判宽即截断（实测踩中）、无 `[DONE]`、流内 error 事件两种形态、**usage 真实存在**（input/output/total_tokens 随 answer 事件递增）⇒ chat 门改为真实透传）；② **U-13 ✅ 关闭**：`chats/new(t2t, 模型)` 可用，🔴 **顶层小写 `chat_id` 必填**（缺 ⇒ `RequestValidationError: Field 'chat_id': Field required`）——据实订正 §4.4（初版误读抓包，被一发 400 当场打回）；③ **图片解析 ✅**（files §4.2 形状进 t2t，上游域内图真实看图作答，经服务全链路 200）；④ 文件/音频/视频（外链）🔴 全拒（`Internal error!` / `invalid_input`）⇒ 登记 **U-15**，chat 门对三类**明确 400** + 证据；⑤ 新增探针 `scripts/probe_chat_parse.py`（text/image/document/audio/video 五格单发取证，原文落档 `var/probe/`）。当日 7 连发零频控（U-14 观察）。测试 165 项全绿 |
+| 2026-09-24 | **工具调用判决**（用户：「是否支持工具调用」）：三发对照实测（① tools+内置搜索开 / ② tools+关搜索）⇒ 上游**不支持** OpenAI 风格函数调用（`tools`/`tool_choice` 静默忽略，`get_weather` 零痕迹、`function_call` 零出现，**U-16 ✅ 关闭**，§4.6）；**内置服务端工具**（`auto_search` 的 `web_search`）照常服务端闭环，SSE 有 `phase:"web_search"` + `function_call`/`function_id` 结构化事件（content 恒空 ⇒ 适配层天然不提取）。chat 门 `tools` 行为维持"忽略 + 降级说明"（与上游一致）。探针 +`tools`/`tools_no_search` 对照格 |
+| 2026-09-24 | **附件上传链落地**（用户：「走他的上传哇」）：`app/upstream/qwen/upload.py` 实现上传链（getstsToken → **OSS V1 签名 PUT**——预签名 URL 7 种头组合全败，改自签即通）；chat 门 file/audio/video 分段 + data: 图片/音视频 ⇒ **服务端代下载/解码 → 上传 → files[] 条目 → qwen 原生解析**（SSRF 防护 + 20MB 上限，`QWEN_UPLOAD_ENABLED`/`QWEN_UPLOAD_MAX_BYTES`，模板 45 键）。经服务实测 PDF/音频/视频全通（U-15 ✅ 关闭）。新增 12 项测试 |
+| 2026-09-24 | **t2t 最大上下文实测（用户：「qwen最大上下文长度是多少帮我测试下」「加代理可以绕过吗」）**：校准比率 ≈1.3 字/token（usage 口径），上游每请求固定注入 ~1.4-2.8K tokens；**密钥首尾双命中法**阶梯探测 ⇒ **≈5 万汉字（usage 39,668 tokens）可靠工作、≥6.2 万汉字触发 x5sec 风控**（秒拒、90s 冷却重试无效）；🔴 **轮换代理两个全新出口 IP 同样秒拒 ⇒ WAF 请求体大小规则、换出口不可绕过**（与 §2.4 结论一致）。**登记 U-17**；`/v1/models` chat 条目 notes 加实测 caveat。实用建议：单次 prompt ≤5 万汉字，更长走分段或方舟回退通道 |
